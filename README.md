@@ -1,1 +1,1 @@
-# Automated AWS Provisioning
+# automated-aws-provisioning
