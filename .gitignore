@@ -1,0 +1,21 @@
+
+# AWS credentials and secrets
+.aws/
+.env
+.env.*
+!.env.example
+credentials
+*.pem
+*.key
+
+# Ansible temporary files
+*.retry
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db

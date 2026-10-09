@@ -1,0 +1,27 @@
+
+---
+- name: Provision a basic AWS security group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: us-east-1
+    security_group_name: ansible-project-test
+    vpc_id: "vpc-0d347abaa076d4f22"
+
+  tasks:
+    - name: Create a security group with no inbound rules
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: Security group created by Ansible for the university project
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id }}"
+        rules: []
+        rules_egress: []
+        state: present
+      register: security_group
+
+    - name: Display security group details
+      ansible.builtin.debug:
+        var: security_group.group_id
