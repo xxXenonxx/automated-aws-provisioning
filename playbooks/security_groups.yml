@@ -11,13 +11,21 @@
     vpc_id: "vpc-0d347abaa076d4f22"
 
   tasks:
-    - name: Create a security group with no inbound rules
+    - name: Create a security group
       amazon.aws.ec2_security_group:
         name: "{{ security_group_name }}"
         description: Security group created by Ansible for the university project
         region: "{{ aws_region }}"
         vpc_id: "{{ vpc_id }}"
-        rules: []
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "41.233.229.181/32"
+          - proto: tcp
+            ports:
+              - 80
+            cidr_ip: "0.0.0.0/0"
         rules_egress: []
         state: present
       register: security_group
