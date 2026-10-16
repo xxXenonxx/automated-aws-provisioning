@@ -1,0 +1,10 @@
+
+---
+- name: Provision AWS Security Groups
+  ansible.builtin.import_playbook: playbooks/security_groups.yml
+
+- name: Provision AWS S3 bucket
+  ansible.builtin.import_playbook: playbooks/s3.yml
+
+- name: Provision AWS EC2 instance
+  ansible.builtin.import_playbook: playbooks/ec2.yml

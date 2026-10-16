@@ -1,0 +1,41 @@
+
+---
+- name: Provision a basic EC2 instance
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: us-east-1
+    ami_id: "ami-0fa5967347d08d2df"
+    vpc_id: "vpc-0d347abaa076d4f22"
+    subnet_id: "subnet-0d150abb3ea59c23d"
+    security_group_name: "ansible-project-test"
+    instance_name: "ansible-project-ec2"
+    instance_type: "t3.micro"
+    key_pair_name: "automated-aws-project-key"
+
+  tasks:
+    - name: Launch an EC2 instance
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name }}"
+        region: "{{ aws_region }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_pair_name }}"
+        vpc_subnet_id: "{{ subnet_id }}"
+        network:
+          assign_public_ip: true
+        security_groups:
+          - "{{ security_group_name }}"
+        state: running
+        wait: true
+      register: ec2_result
+
+    - name: Display EC2 instance details
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ ec2_result.instances[0].instance_id }}"
+          - "Instance state: {{ ec2_result.instances[0].state.name }}"
+          - "Instance type: {{ ec2_result.instances[0].instance_type }}"
+          - "AMI ID: {{ ec2_result.instances[0].image_id }}"
