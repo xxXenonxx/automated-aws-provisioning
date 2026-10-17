@@ -1,0 +1,186 @@
+---
+- name: Deploy Media Gallery Web App with CRUD
+  hosts: all
+  become: true
+  vars:
+
+    db_endpoint: "app-database.cmlocymg6v8q.us-east-1.rds.amazonaws.com"
+    db_password: "SecurePassword123"
+    s3_bucket_name: "chris-app-bucket-12345" # Use your globally unique bucket name
+    
+    # Static variables
+    db_user: "admin"
+    db_port: "3306"
+    region: "us-east-1"
+
+  tasks:
+    - name: Install Apache, PHP, and required extensions
+      ansible.builtin.yum:
+        name:
+          - httpd
+          - php
+          - php-mysqli
+          - php-xml      
+          - php-mbstring 
+          - unzip        
+        state: present
+
+    - name: Start and enable Apache service
+      ansible.builtin.systemd:
+        name: httpd
+        state: started
+        enabled: true
+
+    - name: Install PHP Composer globally
+      ansible.builtin.shell: curl -sS https://getcomposer.org/installer | php && mv composer.phar /usr/local/bin/composer
+      args:
+        creates: /usr/local/bin/composer
+
+    - name: Ensure correct permissions on web directory
+      ansible.builtin.file:
+        path: /var/www/html
+        owner: apache
+        group: apache
+        mode: '0775'
+        state: directory
+
+    - name: Install AWS SDK for PHP via Composer
+      become_user: apache
+      ansible.builtin.command: /usr/local/bin/composer require aws/aws-sdk-php
+      args:
+        chdir: /var/www/html
+        creates: /var/www/html/vendor/autoload.php
+
+    - name: Deploy the Media Gallery PHP Application
+      ansible.builtin.copy:
+        dest: /var/www/html/index.php
+        owner: apache
+        group: apache
+        mode: '0644'
+        content: |
+          <?php
+          require 'vendor/autoload.php';
+          use Aws\S3\S3Client;
+          use Aws\Exception\AwsException;
+
+          $s3_bucket = '{{ s3_bucket_name }}';
+          $db_endpoint = '{{ db_endpoint }}';
+          $db_user = '{{ db_user }}';
+          $db_pass = '{{ db_password }}';
+          
+          $mysqli = new mysqli($db_endpoint, $db_user, $db_pass, "", {{ db_port }});
+          if ($mysqli->connect_error) die("Database connection failed: " . $mysqli->connect_error);
+
+          $mysqli->query("CREATE DATABASE IF NOT EXISTS gallery_db");
+          $mysqli->select_db("gallery_db");
+          $mysqli->query("CREATE TABLE IF NOT EXISTS uploads (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              title VARCHAR(255) NOT NULL,
+              s3_key VARCHAR(255) NOT NULL,
+              upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )");
+
+          $s3 = new S3Client(['region' => '{{ region }}', 'version' => 'latest']);
+
+          // Handle POST Actions (Upload, Edit, Delete)
+          if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+              $action = $_POST['action'] ?? 'upload';
+
+              if ($action === 'upload' && isset($_FILES['fileToUpload'])) {
+                  $title = $mysqli->real_escape_string($_POST['title']);
+                  $file = $_FILES['fileToUpload'];
+                  $s3_key = 'images/' . time() . '_' . basename($file['name']);
+
+                  try {
+                      $s3->putObject(['Bucket' => $s3_bucket, 'Key' => $s3_key, 'SourceFile' => $file['tmp_name']]);
+                      $stmt = $mysqli->prepare("INSERT INTO uploads (title, s3_key) VALUES (?, ?)");
+                      $stmt->bind_param("ss", $title, $s3_key);
+                      $stmt->execute();
+                      $msg = "<p style='color:green;'>Success! File uploaded.</p>";
+                  } catch (AwsException $e) {
+                      $msg = "<p style='color:red;'>Upload Error: " . $e->getMessage() . "</p>";
+                  }
+              }
+              elseif ($action === 'delete' && isset($_POST['id'], $_POST['s3_key'])) {
+                  $id = (int)$_POST['id'];
+                  $s3_key = $_POST['s3_key'];
+                  
+                  try {
+                      // Delete physical file from S3 bucket
+                      $s3->deleteObject(['Bucket' => $s3_bucket, 'Key' => $s3_key]);
+                      // Delete metadata from RDS database
+                      $mysqli->query("DELETE FROM uploads WHERE id = $id");
+                      $msg = "<p style='color:green;'>Media successfully deleted.</p>";
+                  } catch (AwsException $e) {
+                      $msg = "<p style='color:red;'>Delete Error: " . $e->getMessage() . "</p>";
+                  }
+              }
+              elseif ($action === 'edit' && isset($_POST['id'], $_POST['new_title'])) {
+                  $id = (int)$_POST['id'];
+                  $new_title = $mysqli->real_escape_string($_POST['new_title']);
+                  // Update title in RDS database
+                  $mysqli->query("UPDATE uploads SET title = '$new_title' WHERE id = $id");
+                  $msg = "<p style='color:green;'>Title updated.</p>";
+              }
+          }
+          ?>
+          
+          <!DOCTYPE html>
+          <html>
+          <head><title>Secure Media Gallery</title></head>
+          <body style="font-family: Arial; padding: 20px;">
+              <h2>Secure Media Gallery</h2>
+              <?= isset($msg) ? $msg : "" ?>
+              
+              <form method="post" enctype="multipart/form-data" style="background:#f4f4f4; padding:20px; width:400px; border-radius:5px;">
+                  <input type="hidden" name="action" value="upload">
+                  <label><b>Image Title:</b></label><br>
+                  <input type="text" name="title" required style="width:100%; margin-bottom:10px;"><br>
+                  <label><b>Select Media:</b></label><br>
+                  <input type="file" name="fileToUpload" required style="margin-bottom:15px;"><br>
+                  <button type="submit" style="padding:10px 15px; background:#0073bb; color:white; border:none; border-radius:3px;">Upload</button>
+              </form>
+
+              <hr style="margin: 30px 0;">
+              <h3>Gallery</h3>
+              <div style="display: flex; flex-wrap: wrap; gap: 20px;">
+                  <?php
+                  $result = $mysqli->query("SELECT * FROM uploads ORDER BY upload_date DESC");
+                  while($row = $result->fetch_assoc()) {
+                      $cmd = $s3->getCommand('GetObject', ['Bucket' => $s3_bucket, 'Key' => $row['s3_key']]);
+                      $request = $s3->createPresignedRequest($cmd, '+15 minutes');
+                      $presignedUrl = (string)$request->getUri();
+                      $ext = strtolower(pathinfo($row['s3_key'], PATHINFO_EXTENSION));
+                      
+                      echo "<div style='border:1px solid #ccc; padding:15px; border-radius:5px; background:#fafafa; width: 280px;'>";
+                      
+                      if (in_array($ext, ['mp4', 'webm', 'ogg', 'mov'])) {
+                          echo "<video src='{$presignedUrl}' controls style='max-width:100%; display:block; margin-bottom:10px;'></video>";
+                      } else {
+                          echo "<img src='{$presignedUrl}' style='max-width:100%; display:block; margin-bottom:10px;' />";
+                      }
+                      
+                      // Edit Form
+                      echo "<form method='post' style='margin-bottom:10px;'>";
+                      echo "<input type='hidden' name='action' value='edit'>";
+                      echo "<input type='hidden' name='id' value='{$row['id']}'>";
+                      echo "<input type='text' name='new_title' value='" . htmlspecialchars($row['title'], ENT_QUOTES) . "' required style='width:70%;'>";
+                      echo "<button type='submit' style='width:25%; margin-left:2%; background:#28a745; color:white; border:none; cursor:pointer;'>Save</button>";
+                      echo "</form>";
+                      
+                      echo "<small style='color:gray; display:block; margin-bottom:10px;'>Uploaded: " . $row['upload_date'] . "</small>";
+                      
+                      // Delete Form
+                      echo "<form method='post' onsubmit=\"return confirm('Are you sure you want to delete this file? This will remove it from S3 permanently.');\">";
+                      echo "<input type='hidden' name='action' value='delete'>";
+                      echo "<input type='hidden' name='id' value='{$row['id']}'>";
+                      echo "<input type='hidden' name='s3_key' value='" . htmlspecialchars($row['s3_key'], ENT_QUOTES) . "'>";
+                      echo "<button type='submit' style='width:100%; padding:5px; background:#dc3545; color:white; border:none; border-radius:3px; cursor:pointer;'>Delete Media</button>";
+                      echo "</form>";
+                      
+                      echo "</div>";
+                  }
+                  ?>
+              </div>
+          </body>
+          </html>
