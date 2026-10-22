@@ -1,18 +1,63 @@
-
 ---
-- name: Clean up the project AWS resources
+- name: Clean up all project AWS resources
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
     aws_region: us-east-1
+
     ec2_instance_name: ansible-project-ec2
     security_group_name: ansible-project-test
     key_pair_name: automated-aws-project-key
     s3_bucket_filter: automated-aws-provisioning-813334298384-us-east-1-
 
+    db_identifier: automated-aws-project-db
+    db_subnet_group_name: automated-aws-project-db-subnets
+    db_security_group_name: automated-aws-project-db-sg
+    vpc_id: "vpc-0d347abaa076d4f22"
+
   tasks:
+    - name: Find manual snapshots belonging to the project database
+      amazon.aws.rds_snapshot_info:
+        region: "{{ aws_region }}"
+        db_instance_identifier: "{{ db_identifier }}"
+        snapshot_type: manual
+      register: project_db_snapshots
+
+    - name: Delete manual snapshots belonging to the project database
+      amazon.aws.rds_instance_snapshot:
+        region: "{{ aws_region }}"
+        instance_id: "{{ db_identifier }}"
+        snapshot_id: "{{ item.db_snapshot_identifier }}"
+        state: absent
+        wait: true
+      loop: "{{ project_db_snapshots.snapshots | default([]) }}"
+      loop_control:
+        label: "{{ item.db_snapshot_identifier }}"
+
+    - name: Delete the project RDS database without creating a final snapshot
+      amazon.aws.rds_instance:
+        region: "{{ aws_region }}"
+        db_instance_identifier: "{{ db_identifier }}"
+        state: absent
+        skip_final_snapshot: true
+        delete_automated_backups: true
+        wait: true
+
+    - name: Delete the project RDS DB subnet group
+      amazon.aws.rds_subnet_group:
+        region: "{{ aws_region }}"
+        name: "{{ db_subnet_group_name }}"
+        state: absent
+
+    - name: Delete the project RDS security group
+      amazon.aws.ec2_security_group:
+        region: "{{ aws_region }}"
+        name: "{{ db_security_group_name }}"
+        vpc_id: "{{ vpc_id }}"
+        state: absent
+
     - name: Find project EC2 instances
       amazon.aws.ec2_instance_info:
         region: "{{ aws_region }}"
@@ -28,8 +73,7 @@
     - name: Terminate project EC2 instances
       amazon.aws.ec2_instance:
         region: "{{ aws_region }}"
-        instance_ids: >-
-          {{ project_instances.instances | map(attribute='instance_id') | list }}
+        instance_ids: "{{ project_instances.instances | map(attribute='instance_id') | list }}"
         state: absent
         wait: true
       when: project_instances.instances | length > 0
@@ -46,14 +90,15 @@
         region: "{{ aws_region }}"
         state: absent
         force: true
-      loop: "{{ project_buckets.buckets }}"
+      loop: "{{ project_buckets.buckets | default([]) }}"
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Delete the project security group
+    - name: Delete the project EC2 security group
       amazon.aws.ec2_security_group:
         name: "{{ security_group_name }}"
         region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id }}"
         state: absent
 
     - name: Delete the AWS key-pair registration
@@ -65,6 +110,8 @@
     - name: Report cleanup completion
       ansible.builtin.debug:
         msg:
-          - "Cleanup tasks completed."
+          - "Cleanup tasks completed for the configured project resources."
+          - "RDS deletion skips a final snapshot and requests deletion of automated backups."
+          - "Manual RDS snapshots for this database identifier are deleted by this playbook."
           - "The local private key file has not been deleted."
-          - "Check AWS for any remaining resources or charges."
+          - "Verify the resources are gone in AWS and check Billing for remaining charges."

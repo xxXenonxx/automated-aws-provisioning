@@ -8,3 +8,6 @@
 
 - name: Provision AWS EC2 instance
   ansible.builtin.import_playbook: playbooks/ec2.yml
+
+- name: Provision RDS MySQL database
+  ansible.builtin.import_playbook: playbooks/rds.yml
