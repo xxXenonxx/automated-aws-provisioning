@@ -31,7 +31,7 @@
         dest: "{{ private_key_path }}"
         mode: "0400"
         force: true
-      when: key_pair_result.private_key is defined
+      when: key_pair_result.private_key is defined and key_pair_result.private_key | length > 0
 
     - name: Check that the private key file exists
       ansible.builtin.stat:
