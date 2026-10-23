@@ -42,7 +42,6 @@
         db_instance_identifier: "{{ db_identifier }}"
         state: absent
         skip_final_snapshot: true
-        delete_automated_backups: true
         wait: true
 
     - name: Delete the project RDS DB subnet group

@@ -32,7 +32,7 @@
           - db_master_password | length >= 8
           - db_master_password | length <= 41
           - "'/' not in db_master_password"
-          - "'" not in db_master_password"
+          - "not db_master_password is search(\"'\")"
           - "'@' not in db_master_password"
         fail_msg: >-
           Set RDS_MASTER_PASSWORD in the shell environment before running
@@ -134,7 +134,7 @@
           Project: automated-aws-provisioning
           ManagedBy: Ansible
           Purpose: Demonstration
-      no_log: true
+     # no_log: true
       register: rds_result
 
     - name: Display non-secret database details
