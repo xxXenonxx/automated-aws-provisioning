@@ -1,0 +1,4 @@
+# The report generator uses Python's standard library.
+# Install on the Linux control node for live resource, pricing and RDS support reads.
+boto3>=1.39.0,<2
+botocore>=1.39.0,<2

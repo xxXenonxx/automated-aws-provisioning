@@ -1,0 +1,16 @@
+{
+  "monthly_hours": 730,
+  "ec2_root_volume_gib": 8,
+  "ec2_root_volume_type": "gp3",
+  "s3_standard_storage_gb": 10,
+  "s3_put_requests": 1000,
+  "s3_get_requests": 10000,
+  "include_existing_control_node": true,
+  "control_node": {
+    "instance_type": "t3.micro",
+    "root_volume_gib": 8,
+    "root_volume_type": "gp3",
+    "monthly_hours": 730,
+    "public_ipv4_count": 1
+  }
+}

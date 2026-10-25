@@ -1,0 +1,26 @@
+---
+- name: Require the checked workflow's approval before any resource changes
+  ansible.builtin.assert:
+    that:
+      - deployment_creation_approved | default(false) == true
+      - deployment_settings.profile | default('') == 'resource_provisioning'
+      - deployment_instance_names is defined
+      - deployment_instance_names | length == deployment_settings.ec2_instance_count | default(1) | int
+      - deployment_approved_cost_sha256 is defined
+      - deployment_approved_cost_sha256 == deployment_cost_estimate_sha256
+      - current_cost_estimate.source == 'AWS_PRICE_LIST'
+      - current_cost_estimate.sample_only == false
+      - current_cost_estimate.scope.ec2_count | int == deployment_instance_names | length
+    fail_msg: Run validated-site.yml through the deployment launcher. Resource plays require completed preflight, a current live estimate and its approved forecast limit before creation.
+
+- name: Read the approved forecast immediately before this creation stage
+  ansible.builtin.stat:
+    path: "{{ deployment_cost_estimate_path }}"
+    checksum_algorithm: sha256
+  register: creation_forecast_file
+
+- name: Stop if the approved forecast has changed or disappeared
+  ansible.builtin.assert:
+    that:
+      - creation_forecast_file.stat.checksum | default('') == deployment_approved_cost_sha256
+    fail_msg: The forecast changed after approval. Start a fresh validated run before creating or updating resources.

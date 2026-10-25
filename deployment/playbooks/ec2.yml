@@ -1,0 +1,70 @@
+
+---
+- name: Provision the selected project EC2 servers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "{{ deployment_settings.aws_region }}"
+    ami_id: "{{ deployment_settings.ami_id }}"
+    vpc_id: "{{ deployment_settings.vpc_id }}"
+    subnet_id: "{{ deployment_settings.subnet_id }}"
+    security_group_name: "{{ deployment_settings.security_group_name }}"
+    instance_name: "{{ deployment_settings.instance_name }}"
+    instance_type: "{{ deployment_settings.instance_type }}"
+    key_pair_name: "{{ deployment_settings.ec2_key_name }}"
+
+  tasks:
+    - name: Require the approved settings and forecast
+      ansible.builtin.import_tasks: tasks/require_approved_creation.yml
+
+    - name: Create or reuse each individually named project server
+      amazon.aws.ec2_instance:
+        name: "{{ item }}"
+        region: "{{ aws_region }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_pair_name }}"
+        vpc_subnet_id: "{{ subnet_id }}"
+        network:
+          assign_public_ip: true
+        security_groups:
+          - "{{ security_group_name }}"
+        tags:
+          Project: "{{ deployment_settings.project_name }}"
+          Environment: "{{ deployment_settings.environment_name }}"
+          Role: provisioned-server
+          ManagedBy: Ansible
+        volumes: "{{ deployment_root_volume_mapping }}"
+        state: running
+        wait: true
+        cpu_credit_specification: "{{ 'standard' if instance_type is match('^t[0-9]') else omit }}"
+        filters:
+          "tag:Name": "{{ item }}"
+          "tag:Project": "{{ deployment_settings.project_name }}"
+          "tag:Environment": "{{ deployment_settings.environment_name }}"
+          "tag:Role": provisioned-server
+          instance-state-name: [pending, running, stopping, stopped]
+      loop: "{{ deployment_instance_names }}"
+      loop_control:
+        label: "{{ item }}"
+      register: ec2_servers
+
+    - name: Collect every actual server returned by AWS
+      ansible.builtin.set_fact:
+        ec2_result:
+          instances: "{{ ec2_servers.results | map(attribute='instances') | flatten }}"
+
+    - name: Require the requested number of distinct server IDs
+      ansible.builtin.assert:
+        that:
+          - ec2_result.instances | length == deployment_instance_names | length
+          - ec2_result.instances | map(attribute='instance_id') | unique | list | length == deployment_instance_names | length
+        fail_msg: AWS did not return exactly the selected project servers. Inspect the run before continuing.
+
+    - name: Display EC2 instance details
+      ansible.builtin.debug:
+        msg:
+          - "Project server IDs: {{ ec2_result.instances | map(attribute='instance_id') | list }}"
+          - "Project servers requested: {{ deployment_instance_names | length }}; control node is separate."
