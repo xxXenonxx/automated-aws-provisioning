@@ -1,0 +1,5 @@
+# Install in a Python 3.11-3.13 virtual environment on the Linux control node.
+# This rehearsal uses the 2.19 series; review its support lifecycle before
+# extending the controller beyond the current test period.
+ansible-core>=2.19,<2.20
+-r requirements-checks.txt

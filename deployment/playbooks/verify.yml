@@ -1,0 +1,42 @@
+---
+- name: Read-only verification of explicitly recorded project resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Locate the existing root workflow repository
+      ansible.builtin.set_fact:
+        verification_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
+
+    - name: Run scoped read-only AWS checks using the supplied deployment manifest
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ verification_repo_dir }}/tools/project_checks.py"
+          - verify
+          - --manifest
+          - "{{ project_manifest_file | default(verification_repo_dir ~ '/state/deployment.json') }}"
+          - --output-dir
+          - "{{ project_report_dir | default(verification_repo_dir ~ '/reports') }}"
+          - --cost-estimate
+          - "{{ project_cost_estimate_file | default(verification_repo_dir ~ '/reports/cost-estimate.json') }}"
+          - --live
+      register: root_verification
+      changed_when: true
+      failed_when: false
+
+    - name: Show the fresh verification report location
+      ansible.builtin.debug:
+        msg: "Read report.html and report.json in {{ project_report_dir | default(verification_repo_dir ~ '/reports') }}. Application software is not installed or tested by the root provisioning workflow."
+      when: root_verification.rc in [0, 1]
+
+    - name: Explain when no fresh report could be produced
+      ansible.builtin.debug:
+        msg: "Verification could not start or write a fresh report. Check the explicit manifest, Python dependencies and output-directory access. Do not treat a previous report as current evidence."
+      when: root_verification.rc not in [0, 1]
+
+    - name: Return failure if the checked scope did not pass
+      ansible.builtin.assert:
+        that:
+          - root_verification.rc == 0
+        fail_msg: "{{ 'Some resource checks failed or were unavailable; inspect the fresh report.' if root_verification.rc == 1 else 'Verification did not complete; a fresh report may not exist.' }}"

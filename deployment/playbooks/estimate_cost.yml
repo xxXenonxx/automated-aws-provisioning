@@ -1,0 +1,94 @@
+---
+- name: Forecast the selected setup without creating AWS resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Locate the repository and selected cost inputs
+      ansible.builtin.set_fact:
+        cost_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
+
+    - name: Validate cost inputs offline before requesting AWS prices
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ cost_repo_dir }}/tools/cost_estimate.py"
+          - validate
+          - --config
+          - "{{ project_config_file | default(cost_repo_dir ~ '/config/environment.json') }}"
+          - --assumptions
+          - "{{ project_cost_assumptions_file | default(cost_repo_dir ~ '/config/cost-assumptions.json') }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Read the selected settings without replacing validated deployment facts
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(cost_repo_dir ~ '/config/environment.json') }}"
+        name: cost_request_settings
+
+    - name: Read the declared storage and usage assumptions
+      ansible.builtin.include_vars:
+        file: "{{ project_cost_assumptions_file | default(cost_repo_dir ~ '/config/cost-assumptions.json') }}"
+        name: requested_cost_assumptions
+
+    - name: Reject inputs changed after the deployment preflight
+      ansible.builtin.assert:
+        that:
+          - deployment_settings is not defined or cost_request_settings == deployment_settings
+          - deployment_cost_assumptions is not defined or requested_cost_assumptions == deployment_cost_assumptions
+        fail_msg: Settings or cost assumptions changed after preflight. Start a fresh validated run.
+
+    - name: Read current AWS list prices and write the forecast
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ cost_repo_dir }}/tools/cost_estimate.py"
+          - estimate
+          - --config
+          - "{{ project_config_file | default(cost_repo_dir ~ '/config/environment.json') }}"
+          - --assumptions
+          - "{{ project_cost_assumptions_file | default(cost_repo_dir ~ '/config/cost-assumptions.json') }}"
+          - --output
+          - "{{ project_cost_estimate_file | default(cost_repo_dir ~ '/reports/cost-estimate.json') }}"
+          - --html-output
+          - "{{ project_cost_forecast_file | default(cost_repo_dir ~ '/reports/cost-estimate.html') }}"
+          - --live
+      changed_when: true
+      check_mode: false
+
+    - name: Read the newly generated forecast
+      ansible.builtin.include_vars:
+        file: "{{ project_cost_estimate_file | default(cost_repo_dir ~ '/reports/cost-estimate.json') }}"
+        name: current_cost_estimate
+
+    - name: Require complete live prices bound to these exact input values
+      ansible.builtin.assert:
+        that:
+          - current_cost_estimate.status == 'estimated'
+          - current_cost_estimate.source == 'AWS_PRICE_LIST'
+          - current_cost_estimate.sample_only == false
+          - current_cost_estimate.currency == 'USD'
+          - current_cost_estimate.region == cost_request_settings.aws_region
+          - current_cost_estimate.config_sha256 == (cost_request_settings | to_json(sort_keys=true, separators=[',', ':'], ensure_ascii=false) | hash('sha256'))
+          - current_cost_estimate.assumptions_sha256 == (requested_cost_assumptions | to_json(sort_keys=true, separators=[',', ':'], ensure_ascii=false) | hash('sha256'))
+        fail_msg: A complete live forecast for the selected input values is required. No zero-price or sample-price fallback is accepted.
+
+    - name: Fingerprint the exact forecast for the later handover report
+      ansible.builtin.stat:
+        path: "{{ project_cost_estimate_file | default(cost_repo_dir ~ '/reports/cost-estimate.json') }}"
+        checksum_algorithm: sha256
+      register: generated_cost_file
+
+    - name: Preserve the reviewed forecast details for this run
+      ansible.builtin.set_fact:
+        deployment_cost_estimate_path: "{{ project_cost_estimate_file | default(cost_repo_dir ~ '/reports/cost-estimate.json') }}"
+        deployment_cost_estimate_sha256: "{{ generated_cost_file.stat.checksum }}"
+        deployment_cost_total_usd: "{{ current_cost_estimate.totals.combined_monthly_usd }}"
+
+    - name: Show the forecast location and its assumptions
+      ansible.builtin.debug:
+        msg:
+          - "Estimated new resources: USD {{ current_cost_estimate.totals.new_resources_monthly_usd }}/month."
+          - "Estimated controller operation: USD {{ current_cost_estimate.totals.existing_control_node_monthly_usd }}/month."
+          - "Combined forecast: USD {{ current_cost_estimate.totals.combined_monthly_usd }}/month."
+          - "Review {{ project_cost_forecast_file | default(cost_repo_dir ~ '/reports/cost-estimate.html') }} before deployment. This is a forecast, not an AWS spending cap or bill."

@@ -1,0 +1,4 @@
+---
+collections:
+  - name: amazon.aws
+    version: 11.4.0

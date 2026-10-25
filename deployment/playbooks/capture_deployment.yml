@@ -1,0 +1,85 @@
+---
+- name: Capture actual outputs from the existing root provisioning plays
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require outputs from this validated provisioning run
+      ansible.builtin.assert:
+        that:
+          - deployment_settings.profile | default('') == 'resource_provisioning'
+          - deployment_repo_dir is defined
+          - deployment_identity.account is defined
+          - ec2_result.instances | default([]) | length > 0
+          - ec2_result.instances | length == deployment_instance_names | length
+          - security_group.group_id is defined
+          - db_security_group.group_id is defined
+          - rds_result.endpoint.address is defined
+          - s3_bucket_name is defined
+          - deployment_cost_estimate_path is defined
+          - deployment_cost_estimate_sha256 is defined
+          - deployment_rds_engine_version is defined
+        fail_msg: Run validated-site.yml to capture its actual outputs. For a read-only check, supply an existing manifest to playbooks/verify.yml.
+
+    - name: Read the exact forecast used before resource creation
+      ansible.builtin.stat:
+        path: "{{ deployment_cost_estimate_path }}"
+        checksum_algorithm: sha256
+      register: captured_cost_file
+
+    - name: Refuse to bind a changed forecast to the created resources
+      ansible.builtin.assert:
+        that:
+          - captured_cost_file.stat.checksum | default('') == deployment_cost_estimate_sha256
+        fail_msg: The cost forecast changed during deployment. Resources may exist, but this run cannot attach the altered forecast as its approved estimate.
+
+    - name: Create a controller-only state directory
+      ansible.builtin.file:
+        path: "{{ deployment_repo_dir }}/state"
+        state: directory
+        mode: '0700'
+
+    - name: Save nonsecret identifiers and the actual database endpoint
+      ansible.builtin.copy:
+        dest: "{{ deployment_repo_dir }}/state/deployment.json"
+        mode: '0600'
+        content: >-
+          {{ {
+            'schema_version': 1,
+            'project_name': deployment_settings.project_name,
+            'environment_name': deployment_settings.environment_name,
+            'aws_region': deployment_settings.aws_region,
+            'account_id': deployment_identity.account,
+            'created_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+            'cost_estimate_sha256': deployment_cost_estimate_sha256,
+            'resources': {
+              'vpc_id': deployment_settings.vpc_id,
+              'ec2_instance_ids': ec2_result.instances | map(attribute='instance_id') | list,
+              'web_security_group_id': security_group.group_id,
+              'db_security_group_id': db_security_group.group_id,
+              'rds_identifier': deployment_settings.rds_identifier,
+              'rds_endpoint': rds_result.endpoint.address,
+              'rds_port': rds_result.endpoint.port,
+              'rds_engine_version': rds_result.engine_version,
+              's3_bucket_name': s3_bucket_name,
+              'website_url': none
+            },
+            'expected': {
+              'profile': 'resource_provisioning',
+              'application_configured': false,
+              'ec2_count': deployment_instance_names | length,
+              'ec2_instance_type': deployment_settings.instance_type,
+              'ec2_ami_id': deployment_settings.ami_id,
+              'ssh_source_cidr': deployment_settings.ssh_source_cidr,
+              'db_allowed_source_security_group_id': deployment_settings.control_node_security_group_id,
+              'db_publicly_accessible': false,
+              'rds_standard_support_end': deployment_rds_support.standard_support_end,
+              's3_public_access_block': true,
+              's3_encryption': 'AES256',
+              's3_versioning': 'Enabled'
+            }
+          } | to_nice_json }}
+
+    - name: Identify the saved handover manifest
+      ansible.builtin.debug:
+        msg: "Saved actual resource outputs to {{ deployment_repo_dir }}/state/deployment.json. This root workflow creates resources; it does not claim an application was installed."

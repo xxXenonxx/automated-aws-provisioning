@@ -1,0 +1,21 @@
+
+---
+- name: Require checked and priced deployment approval
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Guard the creation stage before loading any resource play
+      ansible.builtin.import_tasks: playbooks/tasks/require_approved_creation.yml
+
+- name: Provision AWS Security Groups
+  ansible.builtin.import_playbook: playbooks/security_groups.yml
+
+- name: Provision AWS S3 bucket
+  ansible.builtin.import_playbook: playbooks/s3.yml
+
+- name: Provision the selected AWS EC2 servers
+  ansible.builtin.import_playbook: playbooks/ec2.yml
+
+- name: Provision RDS MySQL database
+  ansible.builtin.import_playbook: playbooks/rds.yml

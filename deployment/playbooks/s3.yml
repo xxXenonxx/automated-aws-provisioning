@@ -1,0 +1,45 @@
+
+---
+- name: Provision a basic S3 bucket
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "{{ deployment_settings.aws_region }}"
+
+  tasks:
+    - name: Require the approved settings and forecast
+      ansible.builtin.import_tasks: tasks/require_approved_creation.yml
+
+    - name: Use the reviewed bucket name
+      ansible.builtin.set_fact:
+        s3_bucket_name: "{{ deployment_settings.s3_bucket_name }}"
+
+    - name: Create the S3 bucket
+      amazon.aws.s3_bucket:
+        name: "{{ s3_bucket_name }}"
+        region: "{{ aws_region }}"
+        state: present
+        versioning: true
+        encryption: AES256
+        object_ownership: BucketOwnerEnforced
+        public_access:
+          block_public_acls: true
+          ignore_public_acls: true
+          block_public_policy: true
+          restrict_public_buckets: true
+        tags:
+          Project: "{{ deployment_settings.project_name }}"
+          Environment: "{{ deployment_settings.environment_name }}"
+          ManagedBy: Ansible
+          Purpose: Demonstration
+
+    - name: Display the bucket details
+      ansible.builtin.debug:
+        msg:
+          - "Bucket name: {{ s3_bucket_name }}"
+          - "Region: {{ aws_region }}"
+          - "Versioning: enabled"
+          - "Encryption: AES256"
+          - "Public access: blocked"

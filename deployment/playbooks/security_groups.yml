@@ -1,0 +1,42 @@
+
+---
+- name: Provision a basic AWS security group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "{{ deployment_settings.aws_region }}"
+    security_group_name: "{{ deployment_settings.security_group_name }}"
+    vpc_id: "{{ deployment_settings.vpc_id }}"
+
+  tasks:
+    - name: Require the approved settings and forecast
+      ansible.builtin.import_tasks: tasks/require_approved_creation.yml
+
+    - name: Create a security group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: Security group created by Ansible for the university project
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "{{ deployment_settings.ssh_source_cidr }}"
+          - proto: tcp
+            ports:
+              - 80
+            cidr_ip: "0.0.0.0/0"
+        rules_egress: []
+        state: present
+        tags:
+          Project: "{{ deployment_settings.project_name }}"
+          Environment: "{{ deployment_settings.environment_name }}"
+          ManagedBy: Ansible
+      register: security_group
+
+    - name: Display security group details
+      ansible.builtin.debug:
+        var: security_group.group_id

@@ -1,0 +1,60 @@
+---
+# Add validation, real output capture and verification around the team's current
+# root workflow. Run this wrapper to prepare and price the selected server list;
+# the creation-only site.yml is an included stage, not a standalone entry point.
+- name: Check the selected environment before root site.yml creates resources
+  ansible.builtin.import_playbook: playbooks/preflight.yml
+
+- name: Refresh the cost forecast before creating resources
+  ansible.builtin.import_playbook: playbooks/estimate_cost.yml
+
+- name: Require a reviewed monthly forecast ceiling before provisioning
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require an explicit monthly USD ceiling from the reviewed forecast
+      ansible.builtin.assert:
+        that:
+          - approved_monthly_estimate_limit_usd is defined
+          - approved_monthly_estimate_limit_usd | string is match('^[0-9]+([.][0-9]{1,2})?$')
+          - approved_monthly_estimate_limit_usd | float <= 1000000000
+        fail_msg: Review reports/cost-estimate.html, then supply approved_monthly_estimate_limit_usd as a USD amount such as 100.00. No project resources have been created.
+
+    - name: Include the dedicated controller in this own-account operating forecast
+      ansible.builtin.assert:
+        that:
+          - deployment_cost_assumptions.include_existing_control_node == true
+        fail_msg: Include the dedicated control node in the operating-cost assumptions before approving this deployment.
+
+    - name: Stop if the refreshed combined forecast exceeds the reviewed ceiling
+      ansible.builtin.assert:
+        that:
+          - deployment_cost_total_usd | float <= approved_monthly_estimate_limit_usd | float
+        fail_msg: The refreshed combined forecast exceeds the approved monthly estimate limit. Review the setup or explicitly approve a new limit. No project resources have been created.
+
+    - name: Recheck that the forecast file has not changed before creation
+      ansible.builtin.stat:
+        path: "{{ deployment_cost_estimate_path }}"
+        checksum_algorithm: sha256
+      register: approved_cost_file
+
+    - name: Keep creation bound to the forecast just reviewed by this run
+      ansible.builtin.assert:
+        that:
+          - approved_cost_file.stat.checksum | default('') == deployment_cost_estimate_sha256
+        fail_msg: The forecast file changed during approval. Start a fresh validated run.
+
+    - name: Mark this run's creation stage approved only after the forecast checks
+      ansible.builtin.set_fact:
+        deployment_creation_approved: true
+        deployment_approved_cost_sha256: "{{ deployment_cost_estimate_sha256 }}"
+
+- name: Run the existing root provisioning workflow
+  ansible.builtin.import_playbook: site.yml
+
+- name: Record actual outputs from that workflow
+  ansible.builtin.import_playbook: playbooks/capture_deployment.yml
+
+- name: Check provisioned resources and generate a report
+  ansible.builtin.import_playbook: playbooks/verify.yml

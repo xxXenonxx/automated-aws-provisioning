@@ -1,0 +1,428 @@
+---
+- name: Validate the existing-VPC resource provisioning request
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Find repository paths and use the Ansible controller Python
+      ansible.builtin.set_fact:
+        deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        deployment_creation_approved: false
+        deployment_approved_cost_sha256: ''
+
+    - name: Validate the selected JSON without contacting AWS
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/project_checks.py"
+          - validate
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Load the nonsecret overrides used by the existing root playbooks
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: deployment_settings
+
+    - name: Require the root resource provisioning settings profile
+      ansible.builtin.assert:
+        that:
+          - deployment_settings.profile == 'resource_provisioning'
+        fail_msg: Use the root config/environment.example.json profile for validated-site.yml.
+
+    - name: Build server names from the selected count without contacting AWS
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/deployment_plan.py"
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+      register: selected_server_plan
+      changed_when: false
+      check_mode: false
+
+    - name: Reuse the same selected server names throughout this deployment
+      ansible.builtin.set_fact:
+        deployment_instance_names: "{{ (selected_server_plan.stdout | from_json).server_names }}"
+
+    - name: Validate explicit cost assumptions before any AWS resource changes
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/cost_estimate.py"
+          - validate
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+          - --assumptions
+          - "{{ project_cost_assumptions_file | default(deployment_repo_dir ~ '/config/cost-assumptions.json') }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Load the storage and usage assumptions used for this deployment
+      ansible.builtin.include_vars:
+        file: "{{ project_cost_assumptions_file | default(deployment_repo_dir ~ '/config/cost-assumptions.json') }}"
+        name: deployment_cost_assumptions
+
+    - name: Check the existing database password environment variable before any creation
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length >= 8
+          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length <= 41
+          - "'/' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+          - "'\"' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+          - "'@' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+        fail_msg: Set RDS_MASTER_PASSWORD on the control node; use 8-41 characters without /, double quote or @.
+      no_log: true
+
+    - name: Confirm the controller AWS account
+      amazon.aws.aws_caller_info:
+        region: "{{ deployment_settings.aws_region }}"
+      register: deployment_identity
+
+    - name: Check ownership before reusing a database, subnet group or S3 bucket
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/resource_ownership.py"
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+          - --account
+          - "{{ deployment_identity.account }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Read the selected existing VPC
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ deployment_settings.aws_region }}"
+        vpc_ids:
+          - "{{ deployment_settings.vpc_id }}"
+      register: selected_vpc
+
+    - name: Require the selected VPC
+      ansible.builtin.assert:
+        that:
+          - selected_vpc.vpcs | length == 1
+        fail_msg: The selected VPC was not found in this AWS region/account.
+
+    - name: Read existing subnets in the selected VPC
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          vpc-id: "{{ deployment_settings.vpc_id }}"
+      register: selected_subnets
+
+    - name: Require the application subnet and two zones for the database subnet group
+      ansible.builtin.assert:
+        that:
+          - deployment_settings.subnet_id in (selected_subnets.subnets | map(attribute='subnet_id') | list)
+          - selected_subnets.subnets | map(attribute='availability_zone') | unique | list | length >= 2
+        fail_msg: The chosen EC2 subnet must belong to the VPC, and the VPC must have subnets in at least two Availability Zones.
+
+    - name: Read the configured control-node security group
+      amazon.aws.ec2_security_group_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          group-id: "{{ deployment_settings.control_node_security_group_id }}"
+      register: controller_group
+
+    - name: Require the controller security group in the same VPC as the database
+      ansible.builtin.assert:
+        that:
+          - controller_group.security_groups | length == 1
+          - controller_group.security_groups[0].vpc_id == deployment_settings.vpc_id
+        fail_msg: The controller security group must belong to the selected VPC for this database access rule.
+
+    - name: Require distinct managed groups separate from the controller group
+      ansible.builtin.assert:
+        that:
+          - deployment_settings.security_group_name | lower != deployment_settings.db_security_group_name | lower
+          - controller_group.security_groups[0].group_name | lower != deployment_settings.security_group_name | lower
+          - controller_group.security_groups[0].group_name | lower != deployment_settings.db_security_group_name | lower
+        fail_msg: EC2, database and control-node security groups must be three distinct groups. Refusing to overwrite shared or controller access rules.
+
+    - name: Resolve existing groups that these provisioning plays would manage
+      amazon.aws.ec2_security_group_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          vpc-id: "{{ deployment_settings.vpc_id }}"
+          group-name:
+            - "{{ deployment_settings.security_group_name }}"
+            - "{{ deployment_settings.db_security_group_name }}"
+      register: existing_managed_groups
+
+    - name: Reject any managed group that resolves to the controller security group
+      ansible.builtin.assert:
+        that:
+          - item.group_id != deployment_settings.control_node_security_group_id
+          - item.tags.Project | default('') == deployment_settings.project_name
+          - item.tags.Environment | default('') == deployment_settings.environment_name
+        fail_msg: A selected group belongs to the controller, is untagged or belongs to another environment. Review ownership separately or choose a unique name; it was not adopted.
+      loop: "{{ existing_managed_groups.security_groups }}"
+      loop_control:
+        label: "{{ item.group_id }}"
+
+    - name: Confirm the existing EC2 key pair in this region
+      amazon.aws.ec2_key_info:
+        region: "{{ deployment_settings.aws_region }}"
+        names:
+          - "{{ deployment_settings.ec2_key_name }}"
+      register: deployment_key
+
+    - name: Require the configured EC2 key pair
+      ansible.builtin.assert:
+        that:
+          - deployment_key.keypairs | length == 1
+        fail_msg: Run the existing key-pair workflow or choose an existing regional EC2 key pair before deployment.
+
+    - name: Confirm the selected AMI exists in the region
+      amazon.aws.ec2_ami_info:
+        region: "{{ deployment_settings.aws_region }}"
+        image_ids:
+          - "{{ deployment_settings.ami_id }}"
+      register: deployment_ami
+
+    - name: Require an available AMI before any resource creation
+      ansible.builtin.assert:
+        that:
+          - deployment_ami.images | length == 1
+          - deployment_ami.images[0].state == 'available'
+        fail_msg: Select an available AMI in the configured region. This root workflow does not install application software.
+
+    - name: Keep the selected AMI inside the supported Linux list-price model
+      ansible.builtin.assert:
+        that:
+          - deployment_ami.images[0].platform_details | default('') == 'Linux/UNIX'
+          - deployment_ami.images[0].usage_operation | default('') == 'RunInstances'
+          - deployment_ami.images[0].product_codes | default([]) | length == 0
+          - deployment_ami.images[0].root_device_type | default('') == 'ebs'
+          - deployment_ami.images[0].block_device_mappings | selectattr('ebs', 'defined') | list | length == 1
+        fail_msg: This forecast supports a standard Linux/UNIX EBS-backed AMI without Marketplace/software product codes. Choose a matching AMI or extend the cost model before deployment.
+
+    - name: Read the selected EC2 instance type before any resource creation
+      amazon.aws.ec2_instance_type_info:
+        region: "{{ deployment_settings.aws_region }}"
+        instance_types:
+          - "{{ deployment_settings.instance_type }}"
+      register: deployment_instance_type
+
+    - name: Require the selected AMI architecture to work on that instance type
+      ansible.builtin.assert:
+        that:
+          - deployment_instance_type.instance_types | length == 1
+          - deployment_ami.images[0].architecture in deployment_instance_type.instance_types[0].processor_info.supported_architectures
+          - "'ebs' in deployment_instance_type.instance_types[0].supported_root_device_types"
+          - "'on-demand' in deployment_instance_type.instance_types[0].supported_usage_classes"
+        fail_msg: The selected instance type does not support this AMI architecture or the modeled On-Demand EBS setup.
+
+    - name: Identify the AMI root disk rather than assuming a device name
+      ansible.builtin.set_fact:
+        deployment_ami_root_mapping: "{{ deployment_ami.images[0].block_device_mappings | selectattr('device_name', 'equalto', deployment_ami.images[0].root_device_name) | list }}"
+
+    - name: Require a declared root disk at least as large as the selected AMI
+      ansible.builtin.assert:
+        that:
+          - deployment_ami_root_mapping | length == 1
+          - deployment_ami_root_mapping[0].ebs.volume_size is defined
+          - deployment_cost_assumptions.ec2_root_volume_gib | int >= deployment_ami_root_mapping[0].ebs.volume_size | int
+        fail_msg: The estimated EC2 root disk must be at least the AMI minimum size. Update cost-assumptions.json and review the new estimate.
+
+    - name: Use exactly the root disk size and type included in the forecast
+      ansible.builtin.set_fact:
+        deployment_root_volume_mapping:
+          - device_name: "{{ deployment_ami.images[0].root_device_name }}"
+            ebs: "{{ {'volume_size': deployment_cost_assumptions.ec2_root_volume_gib | int, 'volume_type': deployment_cost_assumptions.ec2_root_volume_type, 'delete_on_termination': true} | combine({'iops': 3000, 'throughput': 125} if deployment_cost_assumptions.ec2_root_volume_type == 'gp3' else {}) }}"
+
+    - name: Inspect existing instances with the selected project server name
+      amazon.aws.ec2_instance_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          "tag:Name": "{{ deployment_instance_names }}"
+          instance-state-name: [pending, running, stopping, stopped]
+      register: previous_root_instances
+
+    - name: Reject ambiguous existing server names before creating resources
+      ansible.builtin.assert:
+        that:
+          - previous_root_instances.instances | map(attribute='tags.Name') | unique | list | length == previous_root_instances.instances | length
+        fail_msg: More than one active instance has a selected server name. Resolve the duplicates before creation.
+
+    - name: Read all servers already owned by this project and environment
+      amazon.aws.ec2_instance_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          "tag:Project": "{{ deployment_settings.project_name }}"
+          "tag:Environment": "{{ deployment_settings.environment_name }}"
+          "tag:Role": provisioned-server
+          instance-state-name: [pending, running, stopping, stopped]
+      register: previous_owned_servers
+
+    - name: Do not hide extra retained servers when the requested count is lower
+      ansible.builtin.assert:
+        that:
+          - previous_owned_servers.instances | map(attribute='tags.Name') | difference(deployment_instance_names) | length == 0
+        fail_msg: This environment has servers outside the requested list. Review their removal separately; this workflow does not delete them or exclude their retained cost silently.
+
+    - name: Require an existing named server to match the selected network and AMI
+      ansible.builtin.assert:
+        that:
+          - item.vpc_id == deployment_settings.vpc_id
+          - item.subnet_id == deployment_settings.subnet_id
+          - item.image_id == deployment_settings.ami_id
+          - item.instance_type == deployment_settings.instance_type
+          - item.placement.tenancy | default('default') == 'default'
+          - item.block_device_mappings | length == 1
+          - item.network_interfaces | length == 1
+          - item.network_interfaces[0].private_ip_addresses | length == 1
+          - item.state.name != 'running' or item.public_ip_address | default('') | length > 0
+          - deployment_settings.control_node_security_group_id not in (item.security_groups | map(attribute='group_id') | list)
+          - item.tags.Role | default('') == 'provisioned-server'
+          - item.tags.Project | default('') == deployment_settings.project_name
+          - item.tags.Environment | default('') == deployment_settings.environment_name
+        fail_msg: Refusing to reuse this named server because it is a controller, belongs to another tagged environment, or has a different VPC, subnet or AMI. No provisioning has started.
+      loop: "{{ previous_root_instances.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+
+    - name: Resolve the root disk of every existing selected server
+      ansible.builtin.set_fact:
+        existing_root_disk_ids: "{{ previous_root_instances.instances | map(attribute='block_device_mappings') | flatten | map(attribute='ebs.volume_id') | list }}"
+
+    - name: Identify the dedicated controller from its configured security group
+      amazon.aws.ec2_instance_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          instance.group-id: "{{ deployment_settings.control_node_security_group_id }}"
+          instance-state-name: [running, stopped]
+      register: cost_controller_instances
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Require one controller whose compute and network match its forecast
+      ansible.builtin.assert:
+        that:
+          - cost_controller_instances.instances | length == 1
+          - cost_controller_instances.instances[0].instance_type == deployment_cost_assumptions.control_node.instance_type
+          - cost_controller_instances.instances[0].placement.tenancy | default('default') == 'default'
+          - cost_controller_instances.instances[0].network_interfaces | length == 1
+          - cost_controller_instances.instances[0].network_interfaces[0].private_ip_addresses | length == 1
+          - (1 if cost_controller_instances.instances[0].public_ip_address | default('') | length > 0 else 0) == deployment_cost_assumptions.control_node.public_ipv4_count | int
+          - cost_controller_instances.instances[0].block_device_mappings | length == 1
+        fail_msg: The controller cost assumptions do not match one dedicated instance and its public address. Update the assumptions using your own controller details.
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Inspect the controller AMI billing class without changing it
+      amazon.aws.ec2_ami_info:
+        region: "{{ deployment_settings.aws_region }}"
+        image_ids:
+          - "{{ cost_controller_instances.instances[0].image_id }}"
+      register: cost_controller_ami
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Require the controller to use the supported standard Linux billing class
+      ansible.builtin.assert:
+        that:
+          - cost_controller_ami.images | length == 1
+          - cost_controller_ami.images[0].platform_details | default('') == 'Linux/UNIX'
+          - cost_controller_ami.images[0].usage_operation | default('') == 'RunInstances'
+          - cost_controller_ami.images[0].product_codes | default([]) | length == 0
+        fail_msg: The controller is not a verified standard Linux instance without software product codes. Its operating cost requires another pricing model.
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Identify the actual controller root volume
+      ansible.builtin.set_fact:
+        cost_controller_root_ids: "{{ cost_controller_instances.instances[0].block_device_mappings | selectattr('device_name', 'equalto', cost_controller_instances.instances[0].root_device_name) | map(attribute='ebs.volume_id') | list }}"
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Require one controller root volume before using its storage forecast
+      ansible.builtin.assert:
+        that:
+          - cost_controller_root_ids | length == 1
+        fail_msg: The controller root volume could not be identified. No project resources were created.
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Read the controller root volume details
+      amazon.aws.ec2_vol_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          volume-id: "{{ cost_controller_root_ids }}"
+      register: cost_controller_volume
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Match controller storage to the forecast instead of assuming its disk size
+      ansible.builtin.assert:
+        that:
+          - cost_controller_volume.volumes | length == 1
+          - cost_controller_volume.volumes[0].size | int == deployment_cost_assumptions.control_node.root_volume_gib | int
+          - cost_controller_volume.volumes[0].type == deployment_cost_assumptions.control_node.root_volume_type
+          - cost_controller_volume.volumes[0].type != 'gp3' or (cost_controller_volume.volumes[0].iops | default(0) | int == 3000 and cost_controller_volume.volumes[0].throughput | default(0) | int == 125)
+        fail_msg: The controller storage differs from the forecast or includes unmodeled gp3 performance. Correct the declared assumptions before approving deployment.
+      when: deployment_cost_assumptions.include_existing_control_node
+
+    - name: Require one recorded EBS root disk per existing project server
+      ansible.builtin.assert:
+        that:
+          - existing_root_disk_ids | length == previous_root_instances.instances | length
+          - existing_root_disk_ids | unique | list | length == previous_root_instances.instances | length
+        fail_msg: The existing server root disk cannot be matched to this cost model. No provisioning has started.
+      when: previous_root_instances.instances | length > 0
+
+    - name: Inspect the actual existing root volume using read-only AWS information
+      amazon.aws.ec2_vol_info:
+        region: "{{ deployment_settings.aws_region }}"
+        filters:
+          volume-id: "{{ existing_root_disk_ids }}"
+      register: existing_root_volume
+      when: previous_root_instances.instances | length > 0
+
+    - name: Require an AWS volume record for every selected existing server
+      ansible.builtin.assert:
+        that:
+          - existing_root_volume.volumes | length == previous_root_instances.instances | length
+        fail_msg: An existing server disk could not be inspected; no project resources have been created.
+      when: previous_root_instances.instances | length > 0
+
+    - name: Reject a different existing disk instead of silently using a wrong estimate
+      ansible.builtin.assert:
+        that:
+          - existing_root_volume.volumes | length == previous_root_instances.instances | length
+          - item.size | int == deployment_cost_assumptions.ec2_root_volume_gib | int
+          - item.type == deployment_cost_assumptions.ec2_root_volume_type
+          - item.type != 'gp3' or (item.iops | default(0) | int == 3000 and item.throughput | default(0) | int == 125)
+        fail_msg: The existing root disk differs from the forecast size/type or includes unmodeled gp3 performance. Update assumptions or review a separate volume change; this run will not resize it.
+      loop: "{{ existing_root_volume.volumes | default([]) }}"
+      loop_control:
+        label: "{{ item.id }}"
+      when: previous_root_instances.instances | length > 0
+
+    - name: Resolve a MySQL version inside standard support for the forecast horizon
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/rds_preflight.py"
+          - --region
+          - "{{ deployment_settings.aws_region }}"
+          - --db-identifier
+          - "{{ deployment_settings.rds_identifier }}"
+          - --forecast-days
+          - '31'
+          - --instance-class
+          - "{{ deployment_settings.db_instance_class }}"
+          - --allocated-storage
+          - "{{ deployment_settings.db_allocated_storage | string }}"
+      register: rds_support_check
+      changed_when: false
+      check_mode: false
+
+    - name: Preserve the exact checked database version for provisioning
+      ansible.builtin.set_fact:
+        deployment_rds_support: "{{ rds_support_check.stdout | from_json }}"
+
+    - name: Use the checked version instead of relying on an implicit database default
+      ansible.builtin.set_fact:
+        deployment_rds_engine_version: "{{ deployment_rds_support.engine_version }}"
+
+    - name: Show the preflight scope without exposing credentials
+      ansible.builtin.debug:
+        msg: "Preflight passed for {{ deployment_settings.project_name }}/{{ deployment_settings.environment_name }}. It checked selected inputs and existing resources; it does not prove every later permission or quota."

@@ -1,0 +1,26 @@
+# Credentials and private keys
+.aws/
+.env
+.env.*
+!.env.example
+credentials
+*.pem
+*.key
+
+# Local deployment settings
+config/environment.json
+config/cost-assumptions.json
+
+# Generated files and local environments
+state/
+reports/
+.deployment.lock
+.venv/
+__pycache__/
+*.py[cod]
+*.retry
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db
