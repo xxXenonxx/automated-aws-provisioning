@@ -186,7 +186,6 @@
         multi_az: "{{ settings.db_multi_az }}"
         backup_retention_period: 1
         auto_minor_version_upgrade: true
-        engine_lifecycle_support: open-source-rds-extended-support-disabled
         copy_tags_to_snapshot: true
         tags: "{{ project_tags }}"
         wait: true
