@@ -1,0 +1,71 @@
+---
+- name: Load common settings
+  ansible.builtin.import_tasks: load_config.yml
+
+- name: Require the database secret before changing application configuration
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length >= 8
+      - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length <= 41
+      - "'/' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+      - "'\"' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+      - "'@' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+    fail_msg: Set RDS_MASTER_PASSWORD on the controller before configuring the application.
+  no_log: true
+
+- name: Read the actual deployment outputs
+  ansible.builtin.include_vars:
+    file: "{{ project_state_dir }}/deployment.json"
+    name: deployment
+
+- name: Require a manifest belonging to the selected environment
+  ansible.builtin.assert:
+    that:
+      - deployment.schema_version == 1
+      - deployment.project_name == settings.project_name
+      - deployment.environment_name == settings.environment_name
+      - deployment.aws_region == settings.aws_region
+      - deployment.expected.profile | default('') == 'complete_application'
+      - deployment.resources.ec2_instance_ids | length == settings.ec2_instance_count | default(1) | int
+    fail_msg: The deployment manifest does not match the selected environment. Run validated-site.yml.
+
+- name: Inspect only the exact recorded application instance
+  amazon.aws.ec2_instance_info:
+    region: "{{ settings.aws_region }}"
+    instance_ids: "{{ deployment.resources.ec2_instance_ids }}"
+  register: app_targets
+
+- name: Require exactly the recorded application servers to be returned by AWS
+  ansible.builtin.assert:
+    that:
+      - app_targets.instances | length == deployment.resources.ec2_instance_ids | length
+      - app_targets.instances | map(attribute='instance_id') | difference(deployment.resources.ec2_instance_ids) | length == 0
+    fail_msg: AWS did not return exactly the recorded application servers. No software was changed.
+
+- name: Require that the recorded instance still belongs to this application
+  ansible.builtin.assert:
+    that:
+      - item.state.name == 'running'
+      - item.tags.Project | default('') == settings.project_name
+      - item.tags.Environment | default('') == settings.environment_name
+      - item.tags.Role | default('') == 'application'
+      - item.tags.ManagedBy | default('') == 'Ansible'
+      - item.public_ip_address is defined
+    fail_msg: Refusing to configure an instance without the selected project, environment and application role tags.
+  loop: "{{ app_targets.instances }}"
+  loop_control:
+    label: "{{ item.instance_id }}"
+
+- name: Populate an explicit application-only in-memory inventory
+  ansible.builtin.add_host:
+    name: "{{ item.instance_id }}"
+    groups: project_application_servers
+    ansible_host: "{{ item.public_ip_address }}"
+    ansible_user: "{{ settings.ssh_username | default('ec2-user') }}"
+    ansible_ssh_private_key_file: "{{ settings.ssh_private_key_file | expanduser }}"
+    ansible_ssh_common_args: -o StrictHostKeyChecking=accept-new
+    deployment_settings: "{{ settings }}"
+    deployment_outputs: "{{ deployment }}"
+  loop: "{{ app_targets.instances }}"
+  loop_control:
+    label: "{{ item.instance_id }}"

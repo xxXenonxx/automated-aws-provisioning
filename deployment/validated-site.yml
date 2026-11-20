@@ -1,9 +1,14 @@
 ---
-# Add validation, real output capture and verification around the team's current
-# root workflow. Run this wrapper to prepare and price the selected server list;
-# the creation-only site.yml is an included stage, not a standalone entry point.
+- name: Select the complete or existing-network workflow from saved settings
+  ansible.builtin.import_playbook: playbooks/select_workflow.yml
+
 - name: Check the selected environment before root site.yml creates resources
   ansible.builtin.import_playbook: playbooks/preflight.yml
+  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
+
+- name: Check the team's complete network and application setup
+  ansible.builtin.import_playbook: playbooks/complete/preflight.yml
+  when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Refresh the cost forecast before creating resources
   ansible.builtin.import_playbook: playbooks/estimate_cost.yml
@@ -52,9 +57,24 @@
 
 - name: Run the existing root provisioning workflow
   ansible.builtin.import_playbook: site.yml
+  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
+
+- name: Run the team's complete network and resource creation
+  ansible.builtin.import_playbook: playbooks/complete/provision.yml
+  when: hostvars['localhost'].deployment_workflow == 'complete_application'
+
+- name: Install the team's existing application example
+  ansible.builtin.import_playbook: playbooks/complete/configure.yml
+  when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Record actual outputs from that workflow
   ansible.builtin.import_playbook: playbooks/capture_deployment.yml
+  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
 
 - name: Check provisioned resources and generate a report
   ansible.builtin.import_playbook: playbooks/verify.yml
+  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
+
+- name: Check the complete network, application and approved cost report
+  ansible.builtin.import_playbook: playbooks/complete/verify.yml
+  when: hostvars['localhost'].deployment_workflow == 'complete_application'

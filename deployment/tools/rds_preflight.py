@@ -47,15 +47,16 @@ def _read(client, operation, **kwargs):
     return result
 
 
-def _existing_cost_scope(instance, expected_instance_class, expected_allocated_storage):
+def _existing_cost_scope(instance, expected_instance_class, expected_allocated_storage, expected_multi_az=False):
     """Reject cost changes or unmodeled performance before a later create play."""
     if expected_instance_class is None:
         return
     if (instance.get("DBInstanceClass") != expected_instance_class
             or instance.get("AllocatedStorage") != expected_allocated_storage
             or instance.get("StorageType") != "gp3"
-            or instance.get("MultiAZ") is not False):
-        raise PreflightError("The existing database differs from the forecast class, storage size, gp3 type or Single-AZ layout. Review it explicitly rather than reshaping it in this deployment.")
+            or instance.get("MultiAZ") is not expected_multi_az
+            or instance.get("PubliclyAccessible") is not False):
+        raise PreflightError("The existing database differs from the forecast class, storage size, gp3 type, selected Single-AZ/Multi-AZ layout or private access. Review it explicitly rather than reshaping it in this deployment.")
     baseline_iops, baseline_throughput = (3000, 125) if expected_allocated_storage < 400 else (12000, 500)
     # The supported gp3 API returns these properties. Missing information is not
     # proof that custom performance charges are absent.
@@ -66,7 +67,8 @@ def _existing_cost_scope(instance, expected_instance_class, expected_allocated_s
 
 
 def resolve_engine_support(client, db_identifier, forecast_days=31, now=None,
-                           expected_instance_class=None, expected_allocated_storage=None):
+                           expected_instance_class=None, expected_allocated_storage=None,
+                           expected_multi_az=False):
     """Return a safe version decision after bounded, read-only RDS requests."""
     if not isinstance(db_identifier, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,62}", db_identifier) or db_identifier.endswith("-") or "--" in db_identifier:
         raise PreflightError("Use a valid database identifier.")
@@ -74,6 +76,8 @@ def resolve_engine_support(client, db_identifier, forecast_days=31, now=None,
         raise PreflightError("forecast_days must be a whole number from 1 to 3660.")
     if (expected_instance_class is None) != (expected_allocated_storage is None):
         raise PreflightError("Supply both the expected database class and allocated storage, or neither.")
+    if type(expected_multi_az) is not bool:
+        raise PreflightError("Use true or false for the expected Multi-AZ layout.")
     if expected_instance_class is not None:
         if not isinstance(expected_instance_class, str) or not re.fullmatch(r"db\.[a-z][a-z0-9-]*\.[a-z0-9]+", expected_instance_class):
             raise PreflightError("Use a valid expected RDS instance class.")
@@ -101,7 +105,7 @@ def resolve_engine_support(client, db_identifier, forecast_days=31, now=None,
                 or instance["DBInstanceIdentifier"].lower() != db_identifier.lower()
                 or instance.get("Engine") != "mysql"):
             raise PreflightError("The selected existing database is not the requested MySQL database.")
-        _existing_cost_scope(instance, expected_instance_class, expected_allocated_storage)
+        _existing_cost_scope(instance, expected_instance_class, expected_allocated_storage, expected_multi_az)
         version = instance.get("EngineVersion")
     else:
         # DescribeDBInstances raises DBInstanceNotFound for a missing exact ID;
@@ -155,13 +159,16 @@ def main(argv=None):
     parser.add_argument("--forecast-days", type=int, default=31)
     parser.add_argument("--instance-class", help="Also require an existing database to match this forecast class.")
     parser.add_argument("--allocated-storage", type=int, help="Expected existing gp3 GiB, with --instance-class.")
+    parser.add_argument("--multi-az", choices=("true", "false"), default="false",
+                        help="Expected database availability layout; defaults to false for the resource-only workflow.")
     args = parser.parse_args(argv)
     try:
         if not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]", args.region):
             raise PreflightError("Use a valid AWS Region code.")
         result = resolve_engine_support(live_client(args.region), args.db_identifier,
             forecast_days=args.forecast_days, expected_instance_class=args.instance_class,
-            expected_allocated_storage=args.allocated_storage)
+            expected_allocated_storage=args.allocated_storage,
+            expected_multi_az=args.multi_az == "true")
     except (PreflightError, TypeError, KeyError, OverflowError):
         error = sys.exc_info()[1]
         message = str(error) if isinstance(error, PreflightError) else "RDS support coverage could not be verified from the returned data."
