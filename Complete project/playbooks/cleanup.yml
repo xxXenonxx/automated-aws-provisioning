@@ -4,29 +4,136 @@
   connection: local
   gather_facts: false
   vars:
-    aws_region: "us-east-1"
-    s3_bucket_name: "chris-app-bucket-12345"
-    instance_name: "web-server-1"
+    deployment_repo_dir: "{{ playbook_dir | regex_replace('/Complete project/playbooks$', '/deployment') }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
 
   tasks:
+    - name: Require an explicit cleanup request
+      ansible.builtin.assert:
+        that:
+          - confirm_cleanup | default(false) | bool
+        fail_msg: Cleanup is separate from deployment. Review the saved setup, then explicitly supply confirm_cleanup=true to remove it.
+
+    - name: Read the selected environment
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: settings
+
+    - name: Read the exact saved resource identifiers
+      ansible.builtin.include_vars:
+        file: "{{ project_manifest_file | default(deployment_repo_dir ~ '/state/deployment.json') }}"
+        name: deployment
+
+    - name: Validate the saved resource identifiers before any deletion
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - "import json,sys; sys.path.insert(0,sys.argv[1]); from project_checks import validate_manifest; sys.exit(1 if validate_manifest(json.load(open(sys.argv[2]))) else 0)"
+          - "{{ deployment_repo_dir }}/tools"
+          - "{{ project_manifest_file | default(deployment_repo_dir ~ '/state/deployment.json') }}"
+      changed_when: false
+
+    - name: Confirm the active AWS account
+      amazon.aws.aws_caller_info:
+        region: "{{ settings.aws_region }}"
+      register: cleanup_identity
+
+    - name: Match the saved setup to this environment and account
+      ansible.builtin.assert:
+        that:
+          - settings.profile | default('complete_application') == 'complete_application'
+          - deployment.expected.profile == 'complete_application'
+          - deployment.account_id == cleanup_identity.account
+          - deployment.project_name == settings.project_name
+          - deployment.environment_name == settings.environment_name
+          - deployment.aws_region == settings.aws_region
+          - deployment.resources.rds_identifier == settings.rds_identifier
+          - deployment.resources.s3_bucket_name == settings.s3_bucket_name
+        fail_msg: The saved resources do not match the selected account and environment. Cleanup was refused.
+
+    - name: Check existing network, database and bucket ownership before deletion
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/resource_ownership.py"
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+          - --account
+          - "{{ cleanup_identity.account }}"
+      changed_when: false
+
+    - name: Use the selected region and resource prefix
+      ansible.builtin.set_fact:
+        aws_region: "{{ settings.aws_region }}"
+        project_resource_prefix: "{{ settings.project_name }}-{{ settings.environment_name }}"
+
     - name: Fetch VPC Info
       amazon.aws.ec2_vpc_net_info:
         region: "{{ aws_region }}"
         filters:
-          "tag:Name": "app-vpc"
+          vpc-id: "{{ deployment.resources.vpc_id }}"
       register: vpc_info
 
     - name: Ensure VPC Exists Before Cleanup
       ansible.builtin.assert:
-        that: vpc_info.vpcs | length > 0
-        msg: "VPC 'app-vpc' not found. Cannot proceed with cleanup."
+        that:
+          - vpc_info.vpcs | length == 1
+          - vpc_info.vpcs[0].tags.Project | default('') == settings.project_name
+          - vpc_info.vpcs[0].tags.Environment | default('') == settings.environment_name
+          - vpc_info.vpcs[0].tags.Name | default('') == project_resource_prefix ~ '-vpc'
+          - vpc_info.vpcs[0].cidr_block == settings.vpc_cidr
+        fail_msg: The recorded VPC does not match this environment. Review partial cleanup separately.
+
+    - name: Read the two recorded routing tables inside the owned VPC
+      amazon.aws.ec2_vpc_route_table_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ deployment.resources.vpc_id }}"
+          route-table-id:
+            - "{{ deployment.resources.public_route_table_id }}"
+            - "{{ deployment.resources.private_route_table_id }}"
+      register: cleanup_routes
+
+    - name: Require both recorded routing tables before any deletion
+      ansible.builtin.assert:
+        that:
+          - cleanup_routes.route_tables | length == 2
+          - cleanup_routes.route_tables | map(attribute='tags.Name') | sort | list == [project_resource_prefix ~ '-private-routes', project_resource_prefix ~ '-public-routes']
+        fail_msg: The saved routing tables do not match this environment. Cleanup was refused.
+
+    - name: Exclude unrelated routing tables and the AWS main table
+      ansible.builtin.assert:
+        that:
+          - item.vpc_id == deployment.resources.vpc_id
+          - item.owner_id == cleanup_identity.account
+          - item.tags.Project | default('') == settings.project_name
+          - item.tags.Environment | default('') == settings.environment_name
+          - item.associations | selectattr('main', 'equalto', true) | list | length == 0
+        fail_msg: A saved routing table is outside the owned environment. Cleanup was refused.
+      loop: "{{ cleanup_routes.route_tables }}"
+      loop_control:
+        label: "{{ item.route_table_id }}"
 
     - name: Gather EC2 Instance ID safely
       amazon.aws.ec2_instance_info:
         region: "{{ aws_region }}"
-        filters:
-          "tag:Name": "{{ instance_name }}"
+        instance_ids: "{{ deployment.resources.ec2_instance_ids }}"
       register: ec2_info
+
+    - name: Exclude the controller and any unrelated server
+      ansible.builtin.assert:
+        that:
+          - item.tags.Project | default('') == settings.project_name
+          - item.tags.Environment | default('') == settings.environment_name
+          - item.tags.Role | default('') == 'application'
+          - item.vpc_id == deployment.resources.vpc_id
+          - item.subnet_id == deployment.resources.public_subnet_id
+          - settings.control_node_security_group_id | default('') not in (item.security_groups | map(attribute='group_id') | list)
+        fail_msg: A recorded instance is not an application server from this environment. No cleanup was performed.
+      loop: "{{ ec2_info.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
 
     - name: Terminate EC2 Web Server
       amazon.aws.ec2_instance:
@@ -39,56 +146,58 @@
     - name: Delete RDS Database
       amazon.aws.rds_instance:
         region: "{{ aws_region }}"
-        db_instance_identifier: "app-database"
+        db_instance_identifier: "{{ deployment.resources.rds_identifier }}"
         state: absent
-        skip_final_snapshot: true
+        skip_final_snapshot: "{{ discard_database_snapshot | default(false) | bool }}"
+        final_db_snapshot_identifier: "{{ omit if discard_database_snapshot | default(false) | bool else cleanup_snapshot_name | default(deployment.resources.rds_identifier ~ '-final-' ~ now(utc=true, fmt='%Y%m%d%H%M%S')) }}"
         wait: true
 
     - name: Delete RDS Subnet Group
-      community.aws.rds_subnet_group:
+      amazon.aws.rds_subnet_group:
         region: "{{ aws_region }}"
-        name: "db-subnet-group"
+        name: "{{ project_resource_prefix }}-db-subnets"
         state: absent
 
     - name: Delete RDS Security Group
       amazon.aws.ec2_security_group:
         region: "{{ aws_region }}"
-        name: "db-sg"
+        name: "{{ project_resource_prefix }}-db"
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
         state: absent
 
     - name: Delete EC2 Security Group
       amazon.aws.ec2_security_group:
         region: "{{ aws_region }}"
-        name: "web-sg"
+        name: "{{ project_resource_prefix }}-web"
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
         state: absent
 
-    - name: Delete S3 Bucket and all its contents
+    - name: Remove the recorded bucket, preserving nonempty contents by default
       amazon.aws.s3_bucket:
-        name: chris-app-bucket-12345
+        name: "{{ deployment.resources.s3_bucket_name }}"
+        region: "{{ aws_region }}"
         state: absent
-        force: true
+        force: "{{ delete_bucket_contents | default(false) | bool }}"
 
     - name: Delete Private Subnet (AZ A)
       amazon.aws.ec2_vpc_subnet:
         region: "{{ aws_region }}"
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
-        cidr: 10.0.3.0/24
+        cidr: "{{ settings.private_subnet_a_cidr }}"
         state: absent
 
     - name: Delete Private Subnet (AZ B)
       amazon.aws.ec2_vpc_subnet:
         region: "{{ aws_region }}"
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
-        cidr: 10.0.4.0/24
+        cidr: "{{ settings.private_subnet_b_cidr }}"
         state: absent
 
     - name: Delete Public Subnet (AZ A)
       amazon.aws.ec2_vpc_subnet:
         region: "{{ aws_region }}"
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
-        cidr: 10.0.1.0/24
+        cidr: "{{ settings.public_subnet_cidr }}"
         state: absent
 
     - name: Delete Internet Gateway
@@ -97,25 +206,17 @@
         vpc_id: "{{ vpc_info.vpcs[0].id }}"
         state: absent
    
-    - name: Direct CLI Route Table Cleanup & VPC Teardown
+    - name: Remove the recorded route tables and VPC
       block:
-        - name: Find Custom Route Tables via AWS CLI
-          ansible.builtin.shell: >
-            aws ec2 describe-route-tables 
-            --region "{{ aws_region }}" 
-            --filters "Name=vpc-id,Values={{ vpc_info.vpcs[0].id }}" 
-            --query 'RouteTables[?Associations[0].Main != `true`].RouteTableId' 
-            --output text
-          register: custom_rtbs
-          changed_when: false
-
-        - name: Force Delete Custom Route Tables via AWS CLI
-          ansible.builtin.command: >
-            aws ec2 delete-route-table 
-            --region "{{ aws_region }}" 
-            --route-table-id "{{ item }}"
-          loop: "{{ custom_rtbs.stdout.split() }}"
-          when: custom_rtbs.stdout | length > 0
+        - name: Delete only the two route tables saved by this deployment
+          amazon.aws.ec2_vpc_route_table:
+            region: "{{ aws_region }}"
+            route_table_id: "{{ item }}"
+            lookup: id
+            state: absent
+          loop:
+            - "{{ deployment.resources.public_route_table_id }}"
+            - "{{ deployment.resources.private_route_table_id }}"
 
         - name: Wait for AWS backend to clear dependencies
           ansible.builtin.pause:
@@ -124,7 +225,7 @@
         - name: Delete Custom VPC
           amazon.aws.ec2_vpc_net:
             region: "{{ aws_region }}"
-            name: "app-vpc"
-            cidr_block: 10.0.0.0/16
+            name: "{{ project_resource_prefix }}-vpc"
+            cidr_block: "{{ settings.vpc_cidr }}"
             state: absent
       when: vpc_info.vpcs | length > 0
