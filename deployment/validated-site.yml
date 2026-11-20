@@ -1,14 +1,32 @@
 ---
-- name: Select the complete or existing-network workflow from saved settings
-  ansible.builtin.import_playbook: playbooks/select_workflow.yml
+- name: Read the selected deployment workflow without changing AWS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Locate the added workflow and clear any previous approval
+      ansible.builtin.set_fact:
+        deployment_repo_dir: "{{ playbook_dir }}"
+        deployment_creation_approved: false
+        deployment_approved_cost_sha256: ''
 
-- name: Check the selected environment before root site.yml creates resources
+    - name: Load the user's selected setup
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: deployment_settings
+
+    - name: Choose the existing team architecture or existing-network mode
+      ansible.builtin.set_fact:
+        deployment_workflow: "{{ deployment_settings.profile | default('complete_application') }}"
+
+    - name: Require a supported workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_workflow in ['complete_application', 'resource_provisioning']
+        fail_msg: Choose complete_application for the team's full network and application, or resource_provisioning for an existing network.
+
+- name: Check the selected setup before creation
   ansible.builtin.import_playbook: playbooks/preflight.yml
-  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
-
-- name: Check the team's complete network and application setup
-  ansible.builtin.import_playbook: playbooks/complete/preflight.yml
-  when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Refresh the cost forecast before creating resources
   ansible.builtin.import_playbook: playbooks/estimate_cost.yml
@@ -60,21 +78,16 @@
   when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
 
 - name: Run the team's complete network and resource creation
-  ansible.builtin.import_playbook: playbooks/complete/provision.yml
+  ansible.builtin.import_playbook: ../Complete project/playbooks/provision.yml
   when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Install the team's existing application example
-  ansible.builtin.import_playbook: playbooks/complete/configure.yml
+  ansible.builtin.import_playbook: ../Complete project/playbooks/configure.yml
   when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Record actual outputs from that workflow
   ansible.builtin.import_playbook: playbooks/capture_deployment.yml
   when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
 
-- name: Check provisioned resources and generate a report
+- name: Check the created setup and generate its report
   ansible.builtin.import_playbook: playbooks/verify.yml
-  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
-
-- name: Check the complete network, application and approved cost report
-  ansible.builtin.import_playbook: playbooks/complete/verify.yml
-  when: hostvars['localhost'].deployment_workflow == 'complete_application'
