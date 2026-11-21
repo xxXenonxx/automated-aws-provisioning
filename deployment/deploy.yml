@@ -73,10 +73,10 @@
         deployment_creation_approved: true
         deployment_approved_cost_sha256: "{{ deployment_cost_estimate_sha256 }}"
 
-- name: Run the team's complete network and resource creation
+- name: Create the network and application resources
   ansible.builtin.import_playbook: ../Complete project/playbooks/provision.yml
 
-- name: Install the team's existing application example
+- name: Install the application
   ansible.builtin.import_playbook: ../Complete project/playbooks/configure.yml
 
 - name: Check the created setup and generate its report

@@ -1,5 +1,5 @@
 ---
-# Integrates the team's Complete project network and application playbooks.
+# Network and application deployment.
 - name: Resolve only this deployment application target
   hosts: localhost
   connection: local
@@ -101,7 +101,7 @@
       loop_control:
         label: "{{ item.instance_id }}"
 
-- name: Install the team's Apache and PHP example on the selected application servers
+- name: Install Apache and PHP on the application servers
   hosts: project_application_servers
   become: true
   gather_facts: false
@@ -233,7 +233,7 @@
         mode: '0644'
         content: |
           <?php
-          // Existing team gallery example; connection values come from this deployment.
+          // Application connections come from this deployment.
           require 'vendor/autoload.php';
           $config = json_decode(file_get_contents('/etc/aws-project/app-config.json'), true, 512, JSON_THROW_ON_ERROR);
           use Aws\S3\S3Client;

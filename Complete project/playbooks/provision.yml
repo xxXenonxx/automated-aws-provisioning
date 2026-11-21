@@ -1,5 +1,5 @@
 ---
-# Integrates the team's Complete project network and application playbooks.
+# Network and application deployment.
 - name: Provision the selected project environment
   hosts: localhost
   connection: local

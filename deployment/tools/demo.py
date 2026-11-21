@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.parse
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -38,10 +39,12 @@ def controller_id():
     return urllib.request.urlopen(request, timeout=5).read().decode()
 
 
-def prepare(args, session):
+def prepare(args, session, settings=None, assumptions=None):
     from project_checks import validate_config
+    from cost_estimate import validate_inputs
     target = BASE / "config/environment.json"
-    config = read_json(target if target.exists() else BASE / "config/environment.demo.json")
+    config = settings if settings is not None else read_json(
+        target if target.exists() else BASE / "config/environment.demo.json")
     if config.get("profile") != "complete_application":
         raise RuntimeError("Use the complete_application settings for this demo.")
     if args.servers is not None:
@@ -59,6 +62,10 @@ def prepare(args, session):
     errors = validate_config(config)
     if errors:
         raise RuntimeError("; ".join(item["field"] + ": " + item["message"] for item in errors))
+    usage = BASE / "config/cost-assumptions.json"
+    values = assumptions if assumptions is not None else read_json(
+        usage if usage.exists() else BASE / "config/cost-assumptions.example.json")
+    validate_inputs(config, values)
     image = ec2.describe_images(ImageIds=[config["ami_id"]])["Images"]
     if len(image) != 1 or image[0]["State"] != "available" or image[0]["Architecture"] != "x86_64":
         raise RuntimeError("The selected application image must be available and use x86_64.")
@@ -76,13 +83,157 @@ def prepare(args, session):
             stream.write(result.pop("KeyMaterial"))
     key.chmod(0o600)
     save_json(target, config)
-    usage = BASE / "config/cost-assumptions.json"
-    if not usage.exists():
-        save_json(usage, read_json(BASE / "config/cost-assumptions.example.json"))
+    save_json(usage, values)
     print("Settings ready:", target)
     print("Application servers:", config["ec2_instance_count"], "| Size:", config["instance_type"])
     print("Database:", config["rds_identifier"], "| Bucket:", config["s3_bucket_name"])
     print("The application resources have not been created. Review the cost next.")
+
+
+def ask(label, default, convert=str, minimum=None, maximum=None, choices=None):
+    while True:
+        answer = input(f"{label} [{default}]: ").strip()
+        try:
+            value = convert(str(default) if not answer else answer)
+            if minimum is not None and value < minimum:
+                raise ValueError()
+            if maximum is not None and value > maximum:
+                raise ValueError()
+            if choices is not None and value not in choices:
+                raise ValueError()
+            return value
+        except ValueError:
+            bounds = f" from {minimum} to {maximum}" if minimum is not None else ""
+            allowed = ": " + ", ".join(map(str, choices)) if choices else bounds
+            print("Enter a valid value" + allowed + ".")
+
+
+def yes_no(label, default=False):
+    answer = ask(label + " (yes/no)", "yes" if default else "no",
+                 convert=str.lower, choices=("yes", "no", "y", "n"))
+    return answer in ("yes", "y")
+
+
+def configure(session):
+    from project_checks import validate_config
+    from cost_estimate import validate_inputs
+    from deployment_plan import server_names
+    path = BASE / "config/environment.json"
+    config = read_json(path if path.exists() else BASE / "config/environment.demo.json")
+    path = BASE / "config/cost-assumptions.json"
+    usage = read_json(path if path.exists() else BASE / "config/cost-assumptions.example.json")
+    account = session.client("sts").get_caller_identity()["Account"]
+    config["s3_bucket_name"] = config["s3_bucket_name"].replace("{account_id}", account)
+    ec2 = session.client("ec2")
+    node = ec2.describe_instances(InstanceIds=[controller_id()])["Reservations"][0]["Instances"][0]
+    if not node.get("PublicIpAddress") or len(node["SecurityGroups"]) != 1:
+        raise RuntimeError("Use a controller with a public address and one dedicated security group.")
+    root_id = next(item["Ebs"]["VolumeId"] for item in node["BlockDeviceMappings"]
+                   if item["DeviceName"] == node["RootDeviceName"])
+    volume = ec2.describe_volumes(VolumeIds=[root_id])["Volumes"][0]
+    controller_hours = usage.get("control_node", {}).get("monthly_hours", 730)
+    usage["include_existing_control_node"] = True
+    usage["control_node"] = {"instance_type": node["InstanceType"],
+        "root_volume_gib": volume["Size"], "root_volume_type": volume["VolumeType"],
+        "monthly_hours": controller_hours, "public_ipv4_count": 1}
+    config.update(ssh_source_cidr=node["PublicIpAddress"] + "/32",
+                  control_node_security_group_id=node["SecurityGroups"][0]["GroupId"])
+    previous = read_json(BASE / "state/deployment.json") if (BASE / "state/deployment.json").exists() else None
+    if previous:
+        identity = ("project_name", "environment_name", "aws_region")
+        if (any(config[field] != previous[field] for field in identity)
+                or config["rds_identifier"] != previous["resources"]["rds_identifier"]
+                or config["s3_bucket_name"] != previous["resources"]["s3_bucket_name"]):
+            raise RuntimeError("The local settings do not match this folder's saved deployment.")
+    print("Press Enter to keep each suggested value. Ctrl+C cancels.")
+    print("Application: Apache/PHP example. Database: MySQL. Region:", config["aws_region"])
+    print("The controller address, disk and security group are detected automatically.")
+    if previous:
+        print("This folder already has a deployment. Names remain bound to it; no resources are deleted here.")
+    while True:
+        print("\nApplication servers")
+        config["ec2_instance_count"] = ask("Number of application servers", config["ec2_instance_count"], int, 1, 20)
+        config["instance_type"] = ask("Server size", config["instance_type"])
+        usage["ec2_root_volume_gib"] = ask("Disk per application server (GiB)", usage["ec2_root_volume_gib"], int, 1, 65536)
+        print("\nMySQL database")
+        config["db_instance_class"] = ask("Database size", config["db_instance_class"])
+        config["db_allocated_storage"] = ask("Database storage (GiB)", config["db_allocated_storage"], int, 20, 65536)
+        config["db_multi_az"] = yes_no("Use a standby database (Multi-AZ)", config["db_multi_az"])
+        if yes_no("Change the monthly usage assumptions for pricing"):
+            usage["monthly_hours"] = ask("Application/database running hours", usage["monthly_hours"], float, 0, 744)
+            usage["s3_standard_storage_gb"] = ask("Expected S3 storage (GB)", usage["s3_standard_storage_gb"], float, 0, 100000000)
+            usage["s3_put_requests"] = ask("Expected S3 write requests", usage["s3_put_requests"], int, 0, 1000000000000)
+            usage["s3_get_requests"] = ask("Expected S3 read requests", usage["s3_get_requests"], int, 0, 1000000000000)
+        if yes_no("Change advanced names, network, image or access settings"):
+            if not previous:
+                config["project_name"] = ask("Project label", config["project_name"])
+                config["environment_name"] = ask("Environment label", config["environment_name"])
+                config["rds_identifier"] = ask("Database resource name", config["rds_identifier"])
+                config["s3_bucket_name"] = ask("Private S3 bucket name", config["s3_bucket_name"])
+            else:
+                print("Existing project, environment, region, database and bucket names are retained.")
+            default_name = config.get("instance_name", config["project_name"] + "-" + config["environment_name"] + "-web")
+            config["instance_name"] = ask("Application server base name", default_name)
+            config["ami_id"] = ask("Amazon Linux 2023 x86 image ID", config["ami_id"])
+            usage["ec2_root_volume_type"] = ask("Disk type", usage["ec2_root_volume_type"], choices=("gp2", "gp3"))
+            for field, label in (("vpc_cidr", "VPC address range"), ("public_subnet_cidr", "Public subnet range"),
+                    ("private_subnet_a_cidr", "Private database subnet A range"),
+                    ("private_subnet_b_cidr", "Private database subnet B range")):
+                config[field] = ask(label, config[field])
+            if not previous:
+                config["db_name"] = ask("Database name inside MySQL", config["db_name"])
+                config["db_username"] = ask("Database administrator username", config["db_username"])
+            config["app_instance_profile_name"] = ask("Application IAM instance profile", config["app_instance_profile_name"])
+            config["ec2_key_name"] = ask("Application connection key name", config["ec2_key_name"])
+            config["ssh_private_key_file"] = ask("Private key file on controller", config["ssh_private_key_file"])
+            config["ssh_username"] = ask("Application Linux username", config.get("ssh_username", "ec2-user"))
+            usage["control_node"]["monthly_hours"] = ask("Controller running hours per month", controller_hours, float, 0, 744)
+        errors = validate_config(config)
+        try:
+            validate_inputs(config, usage)
+        except ValueError as error:
+            errors.append({"field": "Cost settings", "message": str(error)})
+        if errors:
+            for item in errors:
+                print(item["field"] + ": " + item["message"])
+            if yes_no("Correct the settings", True):
+                continue
+            return None
+        print("\nReview your request")
+        print("Servers:", ", ".join(server_names(config)))
+        print("Size:", config["instance_type"], "| Disk each:", usage["ec2_root_volume_gib"], "GiB", usage["ec2_root_volume_type"])
+        print("MySQL:", config["db_instance_class"], "| Storage:", config["db_allocated_storage"], "GiB | Multi-AZ:", config["db_multi_az"])
+        print("Database:", config["rds_identifier"], "| Bucket:", config["s3_bucket_name"])
+        print("Running hours:", usage["monthly_hours"], "| Expected S3 storage:", usage["s3_standard_storage_gb"], "GB")
+        print("AWS permissions must allow the selected sizes, names and image. Region follows this controller.")
+        if yes_no("Save this request and calculate the cost", True):
+            return config, usage
+        if not yes_no("Change the answers", True):
+            return None
+
+
+def start(args, session):
+    if not sys.stdin.isatty():
+        raise RuntimeError("Run start in the controller's interactive terminal.")
+    if (BASE / "state/deployment.json").exists():
+        print("A saved deployment already exists.")
+        print("1. Open reports\n2. Review settings and run deployment again\n3. Exit")
+        choice = ask("Choose", "1", choices=("1", "2", "3"))
+        if choice == "1":
+            links(argparse.Namespace(minutes=60), session)
+            return 0
+        if choice == "3":
+            return 0
+    selected = configure(session)
+    if selected is None:
+        print("Cancelled. Settings were not saved and deployment was not started.")
+        return 0
+    prepare(argparse.Namespace(servers=None), session, settings=selected[0], assumptions=selected[1])
+    result = estimate()
+    if result != 0:
+        return result
+    print("Review the estimate above. Enter an accepted USD amount at the next prompt, or type cancel.")
+    return subprocess.call(["bash", str(BASE / "deploy.sh")], cwd=BASE)
 
 
 def estimate():
@@ -131,8 +282,12 @@ def links(args, session):
         url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key},
             ExpiresIn=args.minutes * 60)
         urls.append((name, url))
-    print("Open these reports in your browser. Keep the links private.")
-    print("Links last up to", args.minutes, "minutes, or until the signing credentials expire.")
+    query = urllib.parse.urlencode({"region": config["aws_region"],
+        "prefix": "reports/" + config["environment_name"] + "/", "showversions": "false"})
+    print("Saved reports in AWS (bookmark this location; AWS sign-in required):")
+    print("https://s3.console.aws.amazon.com/s3/buckets/" + bucket + "?" + query)
+    print("The files remain saved until deleted. Only the quick-open links below expire.")
+    print("Quick-open links last up to", args.minutes, "minutes, or until the signing credentials expire.")
     for name, url in urls:
         print(name + ":\n" + url)
 
@@ -205,6 +360,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--region", default="us-east-1")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("start", help="Answer questions, review the estimate and approve deployment.")
     setup = sub.add_parser("prepare", help="Prepare settings and the key on the EC2 controller.")
     setup.add_argument("--servers", type=int, choices=range(1, 21), metavar="1-20")
     sub.add_parser("estimate", help="Generate the live AWS cost forecast on the controller.")
@@ -219,11 +375,13 @@ def main(argv=None):
             return estimate()
         import boto3
         region = args.region
-        if args.command in ("prepare", "links"):
+        if args.command in ("prepare", "links", "start"):
             path = BASE / "config/environment.json"
             selected = read_json(path if path.exists() else BASE / "config/environment.demo.json")
             region = selected["aws_region"]
         session = boto3.Session(region_name=region)
+        if args.command == "start":
+            return start(args, session)
         if args.command == "prepare":
             prepare(args, session)
         elif args.command == "links":
@@ -231,11 +389,18 @@ def main(argv=None):
         else:
             download(args, session)
         return 0
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopped. If deployment already began, check AWS for any created resources.", file=sys.stderr)
+        return 130
     except ImportError:
         print("Install boto3 first: python3 -m pip install --user boto3", file=sys.stderr)
     except Exception as error:
         if isinstance(error, (RuntimeError, FileNotFoundError, json.JSONDecodeError)):
             message = str(error)
+        elif isinstance(getattr(error, "response", None), dict):
+            message = "AWS " + str(error.response.get("Error", {}).get("Code", "error"))
+            message += " during " + str(getattr(error, "operation_name", "the request"))
+            message += ". Check the controller permissions for your selected settings."
         else:
             message = "The step stopped. Check the controller connection, selected settings and AWS permissions."
         print(message, file=sys.stderr)

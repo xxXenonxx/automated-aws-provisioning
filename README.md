@@ -10,14 +10,14 @@ The project creates an application network, one or more EC2 application servers,
 | `deployment/config/environment.demo.json` | Starting settings for the two-server demonstration. |
 | `deployment/config/environment.json` | Your prepared settings; generated locally and excluded from Git. |
 | `deployment/config/cost-assumptions.json` | Expected usage for the estimate; generated locally and excluded from Git. |
-| `deployment/tools/demo.py` | Short commands to prepare settings, estimate cost and view/download reports. |
+| `deployment/tools/demo.py` | Short commands to Prompt for settings, estimate cost and view/download reports. |
 | `deployment/deploy.sh` | Ask for approval/password and run the deployment. |
 | `deployment/deploy.yml` | Ansible workflow: checks, cost, network/resources, software and final checks. |
-| `Complete project/playbooks/provision.yml` | Team network and resource creation. |
-| `Complete project/playbooks/configure.yml` | Team application installation. |
+| `Complete project/playbooks/provision.yml` | Create the network and resources. |
+| `Complete project/playbooks/configure.yml` | Install the application. |
 | `Complete project/playbooks/cleanup.yml` | Cleanup using the saved deployment resource IDs. |
 
-The remaining Python files in `deployment/tools` implement pricing, checks, resource ownership and reporting. Users do not run each file separately. The original root `site.yml` and `playbooks/` are retained for the earlier resource-only version; use `deployment/deploy.sh` for the complete application workflow.
+The remaining Python files in `deployment/tools` implement pricing, checks, resource ownership and reporting. Users do not run each file separately. The root `site.yml` and `playbooks/` contain the earlier resource-only workflow. Use `deployment/tools/demo.py start` for the complete application workflow.
 
 ## Controller setup
 
@@ -47,31 +47,34 @@ cd ~/aws-project-video/deployment
 source /opt/aws-project-venv/bin/activate
 ```
 
-## Prepare, estimate and deploy
+## Configure and deploy
 
 ```bash
-python tools/demo.py prepare
+python tools/demo.py start
 ```
 
-Preparation uses the demo defaults, fills the controller address/security group, formats the bucket name with your AWS account ID and prepares the application SSH key. It creates no application infrastructure. Existing local settings are retained. Change only the application count with `python tools/demo.py prepare --servers 2`, or edit `config/environment.json` before estimating. Defaults and IAM permissions must match your account and region.
+Answer the questions for server count/size, disk size and the MySQL database. Press Enter to keep the displayed value. Usage and advanced settings are optional. The command detects the controller details, shows a request summary and saves the settings after confirmation. It then calculates the cost and asks for an accepted USD estimate limit and the database password before deployment. Type `cancel` at the approval prompt to stop before creating application resources.
+
+If a saved deployment exists, the opening menu offers reports, reviewing the settings/running again, or exit. Opening reports is the default. Existing infrastructure names are retained when reviewing a deployed environment. Capacity reductions, network replacements and database migrations are not performed automatically.
+
+The application currently supports the Apache/PHP example with private MySQL and S3. Region follows the controller. Other names, sizes and images must be allowed by the controller IAM role. The prompts write `config/environment.json` and `config/cost-assumptions.json`; no manual file editing is required. Local settings and private keys stay outside Git.
+
+For separate stages, the existing commands remain available:
 
 ```bash
+python tools/demo.py prepare --servers 2
 python tools/demo.py estimate
 ```
-
-Review the combined monthly forecast, then start deployment:
 
 ```bash
 bash deploy.sh
 ```
 
-Enter the accepted monthly forecast limit and the database password twice at the hidden prompts. The workflow refreshes the forecast and stops before provisioning if it exceeds the approved amount. This limit is not an AWS billing cap. On a rerun, use the database's existing password.
-
-The two-server demo creates `automated-aws-provisioning-video-web` and `automated-aws-provisioning-video-web-02`, alongside the separate controller. Both receive the same software and share the database/bucket. Each server has its own address and disk. This is an initial server-count choice, not automatic scaling or load balancing.
+The accepted amount checks the deployment forecast, not the later AWS bill. On a rerun use the database's existing password.
 
 ## Reports
 
-After a successful deployment, the terminal prints temporary browser links for the setup and cost reports. The HTML files are stored under `reports/` in the existing private project bucket. Public access stays blocked. Anyone holding a link can view that report for up to one hour, or until the signing credentials expire. Keep the links private.
+After a successful deployment, the terminal prints browser links and the saved S3 report location. The HTML files remain stored under `reports/` in the private project bucket until deleted. The printed AWS-console location can be bookmarked; sign in to view or download the saved files there. Public access stays blocked. Anyone holding a link can view that report for up to one hour, or until the signing credentials expire. Keep the links private.
 
 To refresh the links on the controller:
 

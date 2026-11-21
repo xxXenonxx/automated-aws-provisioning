@@ -82,7 +82,11 @@ printf '%s\n' 'Checking local deployment inputs before requesting the database p
     --config config/environment.json --assumptions config/cost-assumptions.json
 
 if [[ -z "$reviewed_monthly_limit" ]]; then
-    IFS= read -r -p 'Approve the deployment estimate up to this USD amount: ' reviewed_monthly_limit
+    IFS= read -r -p 'Approve estimate up to this USD amount (or type cancel): ' reviewed_monthly_limit
+fi
+if [[ "${reviewed_monthly_limit,,}" == cancel ]]; then
+    printf '%s\n' 'Deployment cancelled before resource creation.'
+    exit 0
 fi
 if [[ ! "$reviewed_monthly_limit" =~ ^[0-9]{1,9}([.][0-9]{1,2})?$ ]]; then
     printf '%s\n' 'Use a monthly USD amount such as 55.00.' >&2
