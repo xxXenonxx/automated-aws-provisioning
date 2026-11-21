@@ -13,7 +13,7 @@ if ! id ec2-user >/dev/null 2>&1; then
     exit 1
 fi
 
-dnf install -y python3.11 python3.11-pip tar gzip git
+dnf install -y python3.11 python3.11-pip tar gzip git nano
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 python3.11 -m venv /opt/aws-project-venv
