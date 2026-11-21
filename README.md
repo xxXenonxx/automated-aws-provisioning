@@ -10,7 +10,7 @@ The project creates an application network, one or more EC2 application servers,
 | `deployment/config/environment.demo.json` | Starting settings for the two-server demonstration. |
 | `deployment/config/environment.json` | Your prepared settings; generated locally and excluded from Git. |
 | `deployment/config/cost-assumptions.json` | Expected usage for the estimate; generated locally and excluded from Git. |
-| `deployment/tools/demo.py` | Short commands to prepare settings, estimate cost and copy reports. |
+| `deployment/tools/demo.py` | Short commands to prepare settings, estimate cost and view/download reports. |
 | `deployment/deploy.sh` | Ask for approval/password and run the deployment. |
 | `deployment/deploy.yml` | Ansible workflow: checks, cost, network/resources, software and final checks. |
 | `Complete project/playbooks/provision.yml` | Team network and resource creation. |
@@ -70,6 +70,18 @@ Enter the accepted monthly forecast limit and the database password twice at the
 The two-server demo creates `automated-aws-provisioning-video-web` and `automated-aws-provisioning-video-web-02`, alongside the separate controller. Both receive the same software and share the database/bucket. Each server has its own address and disk. This is an initial server-count choice, not automatic scaling or load balancing.
 
 ## Reports
+
+After a successful deployment, the terminal prints temporary browser links for the setup and cost reports. The HTML files are stored under `reports/` in the existing private project bucket. Public access stays blocked. Anyone holding a link can view that report for up to one hour, or until the signing credentials expire. Keep the links private.
+
+To refresh the links on the controller:
+
+```bash
+python tools/demo.py links
+```
+
+The controller role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::YOUR_BUCKET/reports/*`. The application's image permissions do not need to change. Links are created after the bucket and reports exist; use the terminal estimate or download command before deployment.
+
+### Download a local copy
 
 The deployment writes `reports/cost-estimate.html` and `reports/report.html` on the controller. To download them through CloudShell, clone the same branch there and run:
 

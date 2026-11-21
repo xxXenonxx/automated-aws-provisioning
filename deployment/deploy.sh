@@ -82,7 +82,7 @@ printf '%s\n' 'Checking local deployment inputs before requesting the database p
     --config config/environment.json --assumptions config/cost-assumptions.json
 
 if [[ -z "$reviewed_monthly_limit" ]]; then
-    IFS= read -r -p 'After reviewing the estimate, enter your maximum monthly forecast in USD: ' reviewed_monthly_limit
+    IFS= read -r -p 'Approve the deployment estimate up to this USD amount: ' reviewed_monthly_limit
 fi
 if [[ ! "$reviewed_monthly_limit" =~ ^[0-9]{1,9}([.][0-9]{1,2})?$ ]]; then
     printf '%s\n' 'Use a monthly USD amount such as 55.00.' >&2
@@ -91,7 +91,7 @@ fi
 
 printf '%s\n' \
     'Valid matching password entries will start the approved live AWS deployment.' \
-    "The workflow refreshes pricing and enforces your reviewed USD $reviewed_monthly_limit monthly forecast ceiling."
+    "The refreshed deployment estimate must fit USD $reviewed_monthly_limit. This does not monitor or cap your later AWS bill."
 approved_demo_password=''
 approved_demo_confirmation=''
 if ! IFS= read -r -s -p 'Database password: ' approved_demo_password; then
@@ -120,3 +120,8 @@ unset approved_demo_confirmation
 # is not an argument, an extra variable, a printed message or a stored file.
 RDS_MASTER_PASSWORD="$approved_demo_password" \
     "$PLAYBOOK" -i localhost, deploy.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
+
+unset approved_demo_password
+if ! "$PYTHON" tools/demo.py links; then
+    printf '%s\n' 'Deployment finished, but report links were unavailable. Use the report download command or retry: python tools/demo.py links'
+fi

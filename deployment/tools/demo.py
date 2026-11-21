@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the example request, estimate its cost, or download its HTML reports."""
+"""Prepare a deployment, estimate its cost and open or download its reports."""
 import argparse
 import base64
 import hashlib
@@ -92,6 +92,51 @@ def estimate():
     return subprocess.call([str(playbook), "-i", "localhost,", "playbooks/estimate_cost.yml"], cwd=BASE)
 
 
+def links(args, session):
+    from project_checks import attach_cost_estimate, cost_estimate_html, report_html, validate_manifest
+    config = read_json(BASE / "config/environment.json")
+    manifest = read_json(BASE / "state/deployment.json")
+    report = read_json(BASE / "reports/report.json")
+    account = session.client("sts").get_caller_identity()["Account"]
+    if validate_manifest(manifest) or manifest["account_id"] != account:
+        raise RuntimeError("The saved deployment does not match this AWS account.")
+    for field in ("project_name", "environment_name", "aws_region"):
+        if manifest[field] != config[field] or report["deployment"][field] != manifest[field]:
+            raise RuntimeError("The report does not match the selected deployment.")
+    if (report.get("mode") != "live_read_only" or report["deployment"]["account_id"] != account
+            or manifest["resources"]["s3_bucket_name"] != config["s3_bucket_name"]):
+        raise RuntimeError("Use the live report and bucket belonging to this deployment.")
+    for field in ("ec2_instance_ids", "vpc_id", "rds_identifier", "s3_bucket_name"):
+        if report["resources"][field] != manifest["resources"][field]:
+            raise RuntimeError("The report resource list differs from the saved deployment.")
+    cost_path = BASE / "reports/cost-estimate.json"
+    bound = attach_cost_estimate({}, manifest, cost_path)["cost_estimate"]
+    if bound["status"] != "estimated" or bound["estimate"]["sample_only"]:
+        raise RuntimeError("The cost report must match the live estimate used for deployment.")
+    from botocore.config import Config
+    s3 = session.client("s3", config=Config(signature_version="s3v4"))
+    bucket = config["s3_bucket_name"]
+    tags = s3.get_bucket_tagging(Bucket=bucket, ExpectedBucketOwner=account)["TagSet"]
+    actual = {item["Key"]: item["Value"] for item in tags}
+    if actual.get("Project") != config["project_name"] or actual.get("Environment") != config["environment_name"]:
+        raise RuntimeError("The report bucket does not belong to the selected project.")
+    pages = {"cost-estimate.html": cost_estimate_html(read_json(cost_path)),
+             "report.html": report_html(report)}
+    urls = []
+    for name, html in pages.items():
+        key = "reports/" + config["environment_name"] + "/" + name
+        s3.put_object(Bucket=bucket, Key=key, Body=html.encode("utf-8"),
+            ContentType="text/html; charset=utf-8", ContentDisposition="inline",
+            CacheControl="no-store", ServerSideEncryption="AES256", ExpectedBucketOwner=account)
+        url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=args.minutes * 60)
+        urls.append((name, url))
+    print("Open these reports in your browser. Keep the links private.")
+    print("Links last up to", args.minutes, "minutes, or until the signing credentials expire.")
+    for name, url in urls:
+        print(name + ":\n" + url)
+
+
 def remote_read(ssm, instance_id, code):
     command = "sudo -u ec2-user /opt/aws-project-venv/bin/python -c " + shlex.quote(code)
     sent = ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript",
@@ -163,6 +208,8 @@ def main(argv=None):
     setup = sub.add_parser("prepare", help="Prepare settings and the key on the EC2 controller.")
     setup.add_argument("--servers", type=int, choices=range(1, 21), metavar="1-20")
     sub.add_parser("estimate", help="Generate the live AWS cost forecast on the controller.")
+    pages = sub.add_parser("links", help="Upload HTML reports privately and print temporary browser links.")
+    pages.add_argument("--minutes", type=int, choices=range(1, 61), default=60, metavar="1-60")
     files = sub.add_parser("download", help="Copy generated HTML reports into CloudShell for download.")
     files.add_argument("--controller", help="Controller instance ID if automatic selection is ambiguous.")
     files.add_argument("--cost-only", action="store_true")
@@ -172,13 +219,15 @@ def main(argv=None):
             return estimate()
         import boto3
         region = args.region
-        if args.command == "prepare":
+        if args.command in ("prepare", "links"):
             path = BASE / "config/environment.json"
             selected = read_json(path if path.exists() else BASE / "config/environment.demo.json")
             region = selected["aws_region"]
         session = boto3.Session(region_name=region)
         if args.command == "prepare":
             prepare(args, session)
+        elif args.command == "links":
+            links(args, session)
         else:
             download(args, session)
         return 0
