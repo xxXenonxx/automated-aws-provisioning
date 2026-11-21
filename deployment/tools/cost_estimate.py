@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estimate the supported root deployment from read-only AWS list prices.
+"""Estimate the selected project deployment from read-only AWS list prices.
 
 This is a forecast, not an account bill or a deployment. Live mode uses only
 Pricing.GetProducts; it never creates, changes, or deletes AWS resources. The
@@ -109,8 +109,15 @@ def money(value):
 
 
 def validate_inputs(config, assumptions):
-    if not isinstance(config, dict) or config.get("profile") != "resource_provisioning":
-        raise EstimateError("Use the root resource_provisioning environment settings.")
+    if not isinstance(config, dict) or config.get("profile") not in (None, "resource_provisioning", "complete_application"):
+        raise EstimateError("Use resource_provisioning or complete_application environment settings.")
+    complete_application = config.get("profile") != "resource_provisioning"
+    if complete_application and type(config.get("db_multi_az")) is not bool:
+        raise EstimateError("db_multi_az: choose true or false for the complete application setup.")
+    if config.get("db_publicly_accessible", False) is not False:
+        raise EstimateError("The supported setup keeps the database private; use db_publicly_accessible false.")
+    if not complete_application and config.get("db_multi_az", False) is not False:
+        raise EstimateError("The resource_provisioning workflow uses Single-AZ; use the complete application setup for Multi-AZ.")
     server_count = config.get("ec2_instance_count", 1)
     if type(server_count) is not int or not 1 <= server_count <= 20:
         raise EstimateError("ec2_instance_count: choose a whole number from 1 to 20; the controller is separate.")
@@ -328,6 +335,10 @@ def estimate(config, assumptions, provider, now=None):
     values = validate_inputs(config, assumptions)
     now = now or dt.datetime.now(dt.timezone.utc)
     region = config["aws_region"]
+    complete_application = config.get("profile") != "resource_provisioning"
+    profile = "complete_application" if complete_application else "resource_provisioning"
+    multi_az = config["db_multi_az"] if complete_application else False
+    deployment_option = "Multi-AZ" if multi_az else "Single-AZ"
     lines = []
 
     def add(key, label, service, attributes, quantity, unit, scope="new_resources", suffix=None):
@@ -354,13 +365,17 @@ def estimate(config, assumptions, provider, now=None):
     server("ec2", "Provisioned server", config["instance_type"], values["ec2_root_volume_type"],
            values["ec2_root_volume_gib"], values["monthly_hours"], Decimal("1"), "new_resources",
            count=config.get("ec2_instance_count", 1))
-    add("rds_compute", "RDS MySQL Single-AZ compute", "AmazonRDS",
+    add("rds_compute", f"RDS MySQL {deployment_option} compute", "AmazonRDS",
         {"productFamily": "Database Instance", "instanceType": config["db_instance_class"],
-         "databaseEngine": "MySQL", "deploymentOption": "Single-AZ"}, values["monthly_hours"], "Hrs",
-        suffix="InstanceUsage:" + config["db_instance_class"])
-    add("rds_storage", "RDS gp3 allocated storage (baseline performance included)", "AmazonRDS",
+         "databaseEngine": "MySQL", "deploymentOption": deployment_option}, values["monthly_hours"], "Hrs",
+        suffix=("Multi-AZUsage:" if multi_az else "InstanceUsage:") + config["db_instance_class"])
+    # AWS publishes a separate Multi-AZ storage rate covering this deployment.
+    # Use that rate with the selected allocation; do not double it a second time.
+    storage_label = (f"RDS {deployment_option} gp3 allocated storage (baseline performance included)" if complete_application
+                     else "RDS gp3 allocated storage (baseline performance included)")
+    add("rds_storage", storage_label, "AmazonRDS",
         {"productFamily": "Database Storage", "databaseEngine": "MySQL",
-         "deploymentOption": "Single-AZ", "volumeType": "General Purpose-GP3"},
+         "deploymentOption": deployment_option, "volumeType": "General Purpose-GP3"},
         Decimal(str(config["db_allocated_storage"])), "GB-Mo")
     add("s3_storage", "S3 Standard average storage, including retained versions", "AmazonS3",
         {"productFamily": "Storage", "storageClass": "General Purpose", "volumeType": "Standard"},
@@ -385,20 +400,24 @@ def estimate(config, assumptions, provider, now=None):
             return {key: json_numbers(item) for key, item in value.items()}
         return value
 
+    limitations = list(LIMITATIONS)
+    if complete_application:
+        limitations[1] = (f"The selected number of matching Linux application servers, each with one root disk and one public IPv4 address, and one {deployment_option} MySQL RDS database are included. The team's VPC, public/private subnets, Internet Gateway and routing are created by the application workflow. This model includes no NAT gateway, load balancer, VPC endpoints or separately charged network add-ons.")
+
     return {"schema_version": SCHEMA_VERSION, "status": "estimated", "currency": "USD",
             **input_metadata(config, assumptions),
             "source": provider.source, "sample_only": provider.source == "SAMPLE",
             "title": "SAMPLE COST ESTIMATE — demonstration prices only" if provider.source == "SAMPLE" else "AWS list-price cost estimate",
             "generated_at": now.isoformat().replace("+00:00", "Z"), "region": region,
             "price_api_region": PRICE_ENDPOINT_REGION, "assumptions": json_numbers(values),
-            "scope": {"profile": "resource_provisioning", "ec2_count": config.get("ec2_instance_count", 1), "rds_engine": "MySQL",
-                      "rds_multi_az": False, "rds_storage_type": "gp3", "rds_allocated_storage_gib": int(Decimal(str(config["db_allocated_storage"]))),
+            "scope": {"profile": profile, "ec2_count": config.get("ec2_instance_count", 1), "rds_engine": "MySQL",
+                      "rds_multi_az": multi_az, "rds_storage_type": "gp3", "rds_allocated_storage_gib": int(Decimal(str(config["db_allocated_storage"]))),
                       "new_ec2_instance_type": config["instance_type"], "rds_instance_class": config["db_instance_class"]},
             "line_items": lines, "totals": {"new_resources_monthly_usd": money(new_total),
                 "existing_control_node_monthly_usd": money(controller_total),
                 "combined_monthly_usd": money(new_total + controller_total),
                 "first_month_usd": money(new_total + controller_total), "modeled_upfront_usd": "0.00"},
-            "limitations": LIMITATIONS, "sources": SOURCES}
+            "limitations": limitations, "sources": SOURCES}
 
 
 def write_json(path, value):
@@ -422,7 +441,7 @@ def write_html(path, content):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    command = sub.add_parser("estimate", help="Forecast supported root resource costs; never deploys anything.")
+    command = sub.add_parser("estimate", help="Forecast the selected resource or complete application setup; never deploys anything.")
     command.add_argument("--config", required=True)
     command.add_argument("--assumptions", required=True)
     command.add_argument("--output", required=True)

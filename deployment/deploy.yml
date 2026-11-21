@@ -1,8 +1,31 @@
 ---
-# Add validation, real output capture and verification around the team's current
-# root workflow. Run this wrapper to prepare and price the selected server list;
-# the creation-only site.yml is an included stage, not a standalone entry point.
-- name: Check the selected environment before root site.yml creates resources
+- name: Read the selected deployment workflow without changing AWS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Locate the added workflow and clear any previous approval
+      ansible.builtin.set_fact:
+        deployment_repo_dir: "{{ playbook_dir }}"
+        deployment_creation_approved: false
+        deployment_approved_cost_sha256: ''
+
+    - name: Load the user's selected setup
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: deployment_settings
+
+    - name: Select the complete application workflow
+      ansible.builtin.set_fact:
+        deployment_workflow: "{{ deployment_settings.profile | default('complete_application') }}"
+
+    - name: Require a supported workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_workflow == 'complete_application'
+        fail_msg: Use complete_application for the project network and application.
+
+- name: Check the selected setup before creation
   ansible.builtin.import_playbook: playbooks/preflight.yml
 
 - name: Refresh the cost forecast before creating resources
@@ -50,11 +73,11 @@
         deployment_creation_approved: true
         deployment_approved_cost_sha256: "{{ deployment_cost_estimate_sha256 }}"
 
-- name: Run the existing root provisioning workflow
-  ansible.builtin.import_playbook: site.yml
+- name: Run the team's complete network and resource creation
+  ansible.builtin.import_playbook: ../Complete project/playbooks/provision.yml
 
-- name: Record actual outputs from that workflow
-  ansible.builtin.import_playbook: playbooks/capture_deployment.yml
+- name: Install the team's existing application example
+  ansible.builtin.import_playbook: ../Complete project/playbooks/configure.yml
 
-- name: Check provisioned resources and generate a report
+- name: Check the created setup and generate its report
   ansible.builtin.import_playbook: playbooks/verify.yml

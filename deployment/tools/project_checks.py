@@ -33,7 +33,8 @@ REQUIRED_CONFIG = (
     "db_instance_class", "db_allocated_storage", "db_multi_az",
     "s3_bucket_name", "app_instance_profile_name",
 )
-OPTIONAL_CONFIG = {"ssh_username", "db_publicly_accessible"}
+OPTIONAL_CONFIG = {"profile", "ssh_username", "db_publicly_accessible",
+                   "ec2_instance_count", "instance_name", "control_node_security_group_id"}
 RESOURCE_CONFIG = (
     "profile", "project_name", "environment_name", "aws_region", "vpc_id",
     "subnet_id", "security_group_name", "instance_name", "ami_id",
@@ -45,7 +46,9 @@ RESOURCE_CONFIG = (
 RESOURCE_KEYS = (
     "vpc_id", "ec2_instance_ids", "web_security_group_id",
     "db_security_group_id", "rds_identifier", "rds_endpoint", "rds_port",
-    "s3_bucket_name", "website_url",
+    "s3_bucket_name", "website_url", "website_urls", "public_subnet_id",
+    "private_subnet_ids", "internet_gateway_id", "public_route_table_id",
+    "private_route_table_id",
 )
 EXPECTED_KEYS = (
     "ssh_source_cidr", "db_publicly_accessible", "s3_public_access_block",
@@ -107,13 +110,13 @@ def validate_config(config):
     if not isinstance(config, dict):
         return [{"field": "config", "message": "Use one JSON object of settings."}]
     resource_only = config.get("profile") == "resource_provisioning"
-    if "profile" in config and not resource_only:
-        error("profile", "Use resource_provisioning for the root resource-only workflow, or omit profile for the complete application workflow.")
+    if "profile" in config and config["profile"] not in ("resource_provisioning", "complete_application"):
+        error("profile", "Choose complete_application for the full network and application, or resource_provisioning for the existing-network workflow.")
     required = RESOURCE_CONFIG if resource_only else REQUIRED_CONFIG
     allowed = set(RESOURCE_CONFIG) | {"ec2_instance_count"} if resource_only else set(REQUIRED_CONFIG) | OPTIONAL_CONFIG
     if set(config) - allowed:
         error("config", "Remove unsupported settings; secrets must not be stored in this file.")
-    if resource_only and (type(config.get("ec2_instance_count", 1)) is not int or not 1 <= config.get("ec2_instance_count", 1) <= 20):
+    if type(config.get("ec2_instance_count", 1)) is not int or not 1 <= config.get("ec2_instance_count", 1) <= 20:
         error("ec2_instance_count", "Choose a whole number from 1 to 20 project servers. The controller is separate.")
     for key in required:
         if key not in config or config[key] is None or config[key] == "":
@@ -131,6 +134,8 @@ def validate_config(config):
         "db_username": (r"[A-Za-z][A-Za-z0-9_]{0,15}", "Use a database username starting with a letter (up to 16 characters)."),
         "db_instance_class": (r"db\.[a-z][a-z0-9-]*\.[a-z0-9]+", "Use an RDS instance class, such as db.t3.micro."),
         "app_instance_profile_name": (r"[A-Za-z0-9+=,.@_-]{1,128}", "Use the name of a pre-existing EC2 instance profile for application access."),
+        "control_node_security_group_id": (r"sg-(?:[0-9a-f]{8}|[0-9a-f]{17})", "Use the security-group identifier attached to the EC2 control node."),
+        "instance_name": (r"[A-Za-z][A-Za-z0-9_.-]{0,127}", "Use a server name starting with a letter (up to 128 characters)."),
     }
     if resource_only:
         patterns.update({
@@ -217,15 +222,35 @@ def validate_manifest(manifest):
     resource_only = expected.get("profile") == "resource_provisioning"
     if "ec2_count" in expected and (type(expected["ec2_count"]) is not int or not 1 <= expected["ec2_count"] <= 20):
         errors.append("The expected project-server count must be a whole number from 1 to 20.")
-    if "profile" in expected and not resource_only:
+    complete = expected.get("profile") == "complete_application"
+    if "profile" in expected and expected["profile"] not in ("resource_provisioning", "complete_application"):
         errors.append("The manifest contains an unsupported workflow profile.")
     if resource_only:
         if expected.get("application_configured") is not False:
             errors.append("The resource-only workflow must explicitly declare application_configured false.")
         if not _matches(expected.get("db_allowed_source_security_group_id"), r"sg-(?:[0-9a-f]{8}|[0-9a-f]{17})"):
             errors.append("The resource-only workflow needs its approved database source security-group identifier.")
-    elif expected.get("application_configured") is False:
+    elif expected.get("application_configured") is False and not complete:
         errors.append("Skipping application checks requires the explicit resource_provisioning profile.")
+    if complete:
+        if type(expected.get("application_configured")) is not bool:
+            errors.append("Record whether the complete workflow finished application installation.")
+        if type(expected.get("db_multi_az")) is not bool:
+            errors.append("Record the selected database availability setting.")
+        for key, prefix in (("public_subnet_id", "subnet"), ("internet_gateway_id", "igw"),
+                            ("public_route_table_id", "rtb"), ("private_route_table_id", "rtb")):
+            if not _matches(resources.get(key), prefix + r"-(?:[0-9a-f]{8}|[0-9a-f]{17})"):
+                errors.append("The complete setup needs its actual network identifier: " + key + ".")
+        private_subnets = resources.get("private_subnet_ids")
+        if (not isinstance(private_subnets, list) or len(private_subnets) != 2
+                or len(set(str(item) for item in private_subnets)) != 2
+                or any(not _matches(item, r"subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})") for item in private_subnets)):
+            errors.append("Record two distinct private database subnets for the complete network.")
+        for key in ("vpc_cidr", "public_subnet_cidr", "private_subnet_a_cidr", "private_subnet_b_cidr"):
+            try:
+                _network(expected.get(key))
+            except ValueError:
+                errors.append("Record the approved network range: " + key + ".")
     for key, pattern in (
         ("vpc_id", r"vpc-(?:[0-9a-f]{8}|[0-9a-f]{17})"),
         ("web_security_group_id", r"sg-(?:[0-9a-f]{8}|[0-9a-f]{17})"),
@@ -258,6 +283,21 @@ def validate_manifest(manifest):
                 raise ValueError()
         except (ValueError, TypeError, AttributeError):
             errors.append("Use an HTTP(S) website URL without credentials, query parameters or a nonstandard port.")
+    if complete:
+        website_urls = resources.get("website_urls")
+        if (not isinstance(website_urls, list) or len(website_urls) != len(instance_ids or [])
+                or len(set(str(item) for item in website_urls)) != len(website_urls)):
+            errors.append("Record one distinct website address for every selected application server.")
+        else:
+            for address in website_urls:
+                try:
+                    url = urllib.parse.urlsplit(address)
+                    if (url.scheme not in ("http", "https") or not url.hostname or url.username
+                            or url.password or url.query or url.fragment or url.port not in (None, 80, 443)):
+                        raise ValueError()
+                except (ValueError, TypeError, AttributeError):
+                    errors.append("Use plain HTTP(S) application addresses without credentials or query parameters.")
+                    break
     try:
         ssh_network = _network(expected.get("ssh_source_cidr"))
         if ssh_network.prefixlen < 24 or ssh_network.is_multicast or ssh_network.is_unspecified:
@@ -313,6 +353,7 @@ def verify_manifest(manifest, clients, http_get, *, sample=False):
         raise ValueError("Invalid deployment manifest.")
     resources, expected = manifest["resources"], manifest["expected"]
     resource_only = expected.get("profile") == "resource_provisioning"
+    complete = expected.get("profile") == "complete_application"
     checks = []
 
     def add(check_id, status, message):
@@ -357,6 +398,9 @@ def verify_manifest(manifest, clients, http_get, *, sample=False):
                 "The provisioned EC2 server is running." if item.get("State", {}).get("Name") == "running" else "A provisioned EC2 server is missing or is not running.")
         in_vpc = all(item.get("VpcId") == resources["vpc_id"] for item in instances) and len(found) == len(resources["ec2_instance_ids"])
         add("ec2_network", "passed" if in_vpc else "failed", "Provisioned EC2 servers match the expected VPC." if in_vpc else "A provisioned EC2 server does not match the expected VPC or was not returned.")
+        if complete:
+            subnet_ok = bool(instances) and all(item.get("SubnetId") == resources["public_subnet_id"] for item in instances)
+            add("ec2_public_subnet", "passed" if subnet_ok else "failed", "Application servers are in the created public subnet." if subnet_ok else "An application server is outside the approved public subnet.")
         correct_groups = bool(instances) and all({resources["web_security_group_id"]} == {group.get("GroupId") for group in item.get("SecurityGroups", [])} for item in instances)
         add("ec2_security_group", "passed" if correct_groups else "failed", "Each provisioned EC2 server has exactly its approved access group." if correct_groups else "A provisioned EC2 server's attached access groups differ from the approved setup.")
         if "ec2_count" in expected:
@@ -368,6 +412,47 @@ def verify_manifest(manifest, clients, http_get, *, sample=False):
         if "ec2_ami_id" in expected:
             image_ok = bool(instances) and len(found) == len(resources["ec2_instance_ids"]) and all(item.get("ImageId") == expected["ec2_ami_id"] for item in instances)
             add("ec2_image", "passed" if image_ok else "failed", "All project servers use the selected Linux image." if image_ok else "A project server's Linux image differs from the selected image.")
+
+    if complete:
+        vpcs = call("vpc_read", lambda: clients["ec2"].describe_vpcs(VpcIds=[resources["vpc_id"]]))
+        if vpcs is not None:
+            records = vpcs.get("Vpcs", [])
+            correct = len(records) == 1 and records[0].get("VpcId") == resources["vpc_id"] and records[0].get("CidrBlock") == expected["vpc_cidr"]
+            add("vpc_layout", "passed" if correct else "failed", "The created VPC has the approved network range." if correct else "The VPC or its network range differs from the approved setup.")
+        subnet_ids = [resources["public_subnet_id"], *resources["private_subnet_ids"]]
+        subnet_data = call("subnets_read", lambda: clients["ec2"].describe_subnets(SubnetIds=subnet_ids))
+        if subnet_data is not None:
+            subnet_map = {item.get("SubnetId"): item for item in subnet_data.get("Subnets", [])}
+            public = subnet_map.get(resources["public_subnet_id"], {})
+            private = [subnet_map.get(key, {}) for key in resources["private_subnet_ids"]]
+            correct = (set(subnet_map) == set(subnet_ids)
+                       and all(item.get("VpcId") == resources["vpc_id"] for item in subnet_map.values())
+                       and public.get("CidrBlock") == expected["public_subnet_cidr"]
+                       and public.get("MapPublicIpOnLaunch") is True
+                       and {item.get("CidrBlock") for item in private} == {expected["private_subnet_a_cidr"], expected["private_subnet_b_cidr"]}
+                       and all(item.get("MapPublicIpOnLaunch") is False for item in private)
+                       and len({item.get("AvailabilityZone") for item in private}) == 2
+                       and all(item.get("AvailabilityZone") for item in private))
+            add("subnet_layout", "passed" if correct else "failed", "The public subnet and two private database subnets match the approved layout." if correct else "The public/private subnet ranges, placement or public-address settings differ from the approved layout.")
+        gateway_data = call("internet_gateway_read", lambda: clients["ec2"].describe_internet_gateways(InternetGatewayIds=[resources["internet_gateway_id"]]))
+        if gateway_data is not None:
+            correct = any(item.get("InternetGatewayId") == resources["internet_gateway_id"] and any(attachment.get("VpcId") == resources["vpc_id"] and attachment.get("State") == "available" for attachment in item.get("Attachments", [])) for item in gateway_data.get("InternetGateways", []))
+            add("internet_gateway", "passed" if correct else "failed", "The project's internet gateway is attached to its VPC." if correct else "The expected internet gateway is not attached to the project VPC.")
+        routes = call("routing_read", lambda: clients["ec2"].describe_route_tables(RouteTableIds=[resources["public_route_table_id"], resources["private_route_table_id"]]))
+        if routes is not None:
+            tables = {item.get("RouteTableId"): item for item in routes.get("RouteTables", [])}
+            public = tables.get(resources["public_route_table_id"], {})
+            private = tables.get(resources["private_route_table_id"], {})
+            public_ok = (public.get("VpcId") == resources["vpc_id"]
+                         and resources["public_subnet_id"] in {item.get("SubnetId") for item in public.get("Associations", [])}
+                         and any(route.get("DestinationCidrBlock") == "0.0.0.0/0" and route.get("GatewayId") == resources["internet_gateway_id"] and route.get("State") == "active" for route in public.get("Routes", [])))
+            private_routes = private.get("Routes", [])
+            private_ok = (private.get("VpcId") == resources["vpc_id"]
+                          and set(resources["private_subnet_ids"]) <= {item.get("SubnetId") for item in private.get("Associations", [])}
+                          and bool(private_routes)
+                          and all(route.get("GatewayId") == "local" and route.get("State") == "active" for route in private_routes))
+            add("public_routing", "passed" if public_ok else "failed", "The public server subnet routes to the project's internet gateway." if public_ok else "The public subnet's internet route or route-table association differs from the approved setup.")
+            add("private_routing", "passed" if private_ok else "failed", "The database subnets use local-only private routing." if private_ok else "A private database subnet has unexpected routing or is not associated with the approved private route table.")
 
     groups = call("access_rules_read", lambda: clients["ec2"].describe_security_groups(GroupIds=[resources["web_security_group_id"], resources["db_security_group_id"]]))
     if groups is not None:
@@ -404,6 +489,13 @@ def verify_manifest(manifest, clients, http_get, *, sample=False):
         add("rds_security_group", "passed" if group_ok else "failed", "The database has exactly its approved access group." if group_ok else "The database's attached access groups differ from the approved setup.")
         endpoint_ok = (database.get("Endpoint", {}).get("Address") == resources["rds_endpoint"] and database.get("Endpoint", {}).get("Port") == resources["rds_port"])
         add("rds_endpoint", "passed" if endpoint_ok else "failed", "The manifest database address and port match AWS." if endpoint_ok else "The manifest database address or port differs from AWS.")
+        if complete:
+            placement = database.get("DBSubnetGroup", {})
+            database_subnets = {item.get("SubnetIdentifier") for item in placement.get("Subnets", [])}
+            placement_ok = placement.get("VpcId") == resources["vpc_id"] and database_subnets == set(resources["private_subnet_ids"])
+            add("rds_private_subnets", "passed" if placement_ok else "failed", "The database is placed in the two created private subnets." if placement_ok else "The database subnet group differs from the approved private network.")
+            availability_ok = database.get("MultiAZ") is expected["db_multi_az"]
+            add("rds_availability", "passed" if availability_ok else "failed", "Database availability matches the selected and priced setup." if availability_ok else "Database availability differs from the selected and priced setup.")
 
     bucket_args = {"Bucket": resources["s3_bucket_name"], "ExpectedBucketOwner": manifest["account_id"]}
     block = call("s3_public_access_read", lambda: clients["s3"].get_public_access_block(**bucket_args))
@@ -423,10 +515,25 @@ def verify_manifest(manifest, clients, http_get, *, sample=False):
 
     host = urllib.parse.urlsplit(resources["website_url"]).hostname if resources["website_url"] else None
     live_hosts = {str(item.get(key, "")).lower() for item in instances for key in ("PublicDnsName", "PublicIpAddress") if item.get(key)}
-    if resource_only:
+    if complete and expected.get("application_configured") is not True:
+        add("application_installation", "failed", "Application installation has not completed for this setup. No application success is claimed.")
+        add("website_http", "not_checked", "The application installation stage has not completed.")
+    elif resource_only:
         add("website_http", "not_checked", "No application setup is declared for this resource-only workflow. No website response is claimed or requested.")
     elif not instances or any(item.get("State", {}).get("Name") != "running" for item in instances):
         add("website_http", "not_checked", "The HTTP check was not started because application-server readiness could not be confirmed.")
+    elif complete:
+        for index, address in enumerate(resources["website_urls"], start=1):
+            address_host = urllib.parse.urlsplit(address).hostname
+            if not address_host or address_host.lower() not in live_hosts:
+                add("website_http_" + str(index), "failed", "An application address does not match the recorded AWS servers. No HTTP request was sent.")
+                continue
+            try:
+                status = http_get(address)
+                responding = type(status) is int and 200 <= status < 300
+                add("website_http_" + str(index), "passed" if responding else "failed", "The application server returned an HTTP success response. Database and storage operations need separate authenticated checks." if responding else "The application server did not return an HTTP success response.")
+            except Exception:
+                add("website_http_" + str(index), "error", "The application server could not be reached within the bounded HTTP check.")
     elif host.lower() not in live_hosts:
         add("website_http", "failed", "The website host does not match a public address of the specified application servers. No HTTP request was sent.")
     else:
@@ -551,7 +658,11 @@ def sanitize_cost_estimate(value):
             raise ValueError("Invalid controller assumptions")
         result["assumptions"]["control_node"] = {"instance_type": node["instance_type"], "root_volume_type": node["root_volume_type"], **{key: _cost_number(node.get(key)) for key in ("root_volume_gib", "monthly_hours", "public_ipv4_count")}}
     scope = value.get("scope")
-    if not isinstance(scope, dict) or scope.get("profile") != "resource_provisioning" or type(scope.get("ec2_count")) is not int or not 1 <= scope["ec2_count"] <= 20 or scope.get("rds_multi_az") is not False or scope.get("rds_engine") != "MySQL" or scope.get("rds_storage_type") != "gp3":
+    if (not isinstance(scope, dict) or scope.get("profile") not in ("resource_provisioning", "complete_application")
+            or type(scope.get("ec2_count")) is not int or not 1 <= scope["ec2_count"] <= 20
+            or type(scope.get("rds_multi_az")) is not bool
+            or (scope.get("profile") == "resource_provisioning" and scope.get("rds_multi_az") is not False)
+            or scope.get("rds_engine") != "MySQL" or scope.get("rds_storage_type") != "gp3"):
         raise ValueError("Unsupported cost scope")
     result["scope"] = {key: scope[key] for key in ("profile", "ec2_count", "rds_multi_az", "rds_engine", "rds_storage_type")}
     for key, pattern in (("new_ec2_instance_type", r"[a-z][a-z0-9-]*\.[a-z0-9]+"), ("rds_instance_class", r"db\.[a-z][a-z0-9-]*\.[a-z0-9]+")):
@@ -663,6 +774,10 @@ def attach_cost_estimate(report, manifest, path=None):
         return unavailable("The estimate belongs to a different project, environment or AWS Region. Regenerate it for this deployment.")
     if estimate["scope"]["ec2_count"] != len(manifest["resources"]["ec2_instance_ids"]):
         return unavailable("The estimate's project-server count does not match the recorded deployment. No amount is shown from a mismatched setup.")
+    manifest_profile = manifest["expected"].get("profile", "complete_application")
+    if (estimate["scope"]["profile"] != manifest_profile
+            or estimate["scope"]["rds_multi_az"] != manifest["expected"].get("db_multi_az", False)):
+        return unavailable("The estimate's network workflow or database availability differs from the recorded setup. No mismatched amount is shown.")
     notice = ("SAMPLE COST ESTIMATE — demonstration prices only, even if resource checks use live AWS data." if estimate["sample_only"] else "ESTIMATE — AWS public list-price forecast, not an AWS bill or guaranteed charge.")
     report["cost_estimate"] = {"status": "estimated", "evidence_notice": notice, "sha256": expected_digest, "estimate": estimate}
     return report
@@ -759,7 +874,8 @@ def cost_estimate_section_html(cost):
         ("Project servers", str(scope["ec2_count"]) + " Linux " + scope["new_ec2_instance_type"] + "; each with a " +
          _report_number(assumptions["ec2_root_volume_gib"]) + " GiB " + assumptions["ec2_root_volume_type"] + " disk"),
         ("Database", "MySQL " + scope["rds_instance_class"] + "; " +
-         _report_number(scope["rds_allocated_storage_gib"]) + " GiB gp3 storage; runs in one Availability Zone"),
+         _report_number(scope["rds_allocated_storage_gib"]) + " GiB gp3 storage; " +
+         ("primary and standby in two Availability Zones" if scope["rds_multi_az"] else "runs in one Availability Zone")),
         ("Expected S3 storage", _report_number(assumptions["s3_standard_storage_gb"]) +
          " GB stored on average, including older file versions; this is expected usage, not reserved space"),
         ("Expected S3 requests per month", _report_number(assumptions["s3_put_requests"]) +
@@ -819,6 +935,9 @@ def report_html(report):
         "web_security_group_id": "Server security group", "db_security_group_id": "Database security group",
         "rds_identifier": "Database name in AWS", "rds_endpoint": "Database address", "rds_port": "Database port",
         "s3_bucket_name": "S3 bucket", "website_url": "Website address",
+        "website_urls": "Project website addresses", "public_subnet_id": "Public server subnet",
+        "private_subnet_ids": "Private database subnets", "internet_gateway_id": "Internet gateway",
+        "public_route_table_id": "Public routing", "private_route_table_id": "Private routing",
     }
     metadata = []
     for key, label in deployment_labels.items():
@@ -848,6 +967,13 @@ def report_html(report):
         "aws_account": "Correct AWS account", "deployment_checks": "Resource checks", "ec2_read": "Read server details",
         "ec2_network": "Server network", "ec2_security_group": "Server security group",
         "ec2_count": "Requested project-server count", "ec2_instance_type": "Selected server type", "ec2_image": "Selected Linux image",
+        "ec2_public_subnet": "Application server subnet", "vpc_read": "Read project network",
+        "vpc_layout": "Project network range", "subnets_read": "Read public and private subnets",
+        "subnet_layout": "Public and private subnet layout", "internet_gateway_read": "Read internet gateway",
+        "internet_gateway": "Internet gateway attachment", "routing_read": "Read network routing",
+        "public_routing": "Public server routing", "private_routing": "Private database routing",
+        "rds_private_subnets": "Database private subnets", "rds_availability": "Database availability setting",
+        "application_installation": "Application installation",
         "access_rules_read": "Read access rules", "access_groups": "Security groups",
         "ssh_access_rules": "SSH access", "database_access_rules": "Database access",
         "rds_read": "Read database details", "rds_ready": "Database available", "rds_private": "Database privacy",
@@ -864,6 +990,8 @@ def report_html(report):
         label = check_labels.get(check["id"], "Resource check")
         if check["id"].startswith("ec2_state_"):
             label = "EC2 server running"
+        elif check["id"].startswith("website_http_"):
+            label = "Application server response"
         message = check["message"]
         for old, new in (("deployment manifest", "saved setup"), ("manifest database", "saved database"),
                          ("manifest", "saved setup"), ("resource-only workflow", "resource creation stage"),
@@ -935,6 +1063,10 @@ class SnapshotClient:
         "get_public_access_block": "s3_public_access_block",
         "get_bucket_encryption": "s3_encryption",
         "get_bucket_versioning": "s3_versioning",
+        "describe_vpcs": "vpcs",
+        "describe_subnets": "subnets",
+        "describe_internet_gateways": "internet_gateways",
+        "describe_route_tables": "route_tables",
     }
 
     def __init__(self, snapshot):
@@ -1016,7 +1148,7 @@ def main(argv=None):
             import boto3
             from botocore.config import Config
         except ImportError:
-            print("Live checks need boto3. Install requirements-checks.txt in the Linux control-node environment first.", file=sys.stderr)
+            print("Live checks need boto3. Install requirements.txt in the Linux control-node environment first.", file=sys.stderr)
             return 2
         try:
             session = boto3.Session(region_name=manifest["aws_region"])

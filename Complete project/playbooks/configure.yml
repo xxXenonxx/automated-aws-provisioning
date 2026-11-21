@@ -1,78 +1,255 @@
 ---
-- name: Deploy Media Gallery Web App with CRUD
-  hosts: all
-  become: true
+# Integrates the team's Complete project network and application playbooks.
+- name: Resolve only this deployment application target
+  hosts: localhost
+  connection: local
+  gather_facts: false
   vars:
-
-    db_endpoint: "app-database.cmlocymg6v8q.us-east-1.rds.amazonaws.com"
-    db_password: "SecurePassword123"
-    s3_bucket_name: "chris-app-bucket-12345" # Use your globally unique bucket name
-    
-    # Static variables
-    db_user: "admin"
-    db_port: "3306"
-    region: "us-east-1"
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
   tasks:
-    - name: Install Apache, PHP, and required extensions
-      ansible.builtin.yum:
+    - name: Locate the shared deployment workflow
+      ansible.builtin.set_fact:
+        deployment_repo_dir: "{{ playbook_dir | regex_replace('/Complete project/playbooks$', '/deployment') }}"
+
+    - name: Read the selected nonsecret environment settings
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: settings
+
+    - name: Keep the selected settings bound to the checked deployment
+      ansible.builtin.assert:
+        that:
+          - settings.profile | default('complete_application') == 'complete_application'
+          - deployment_settings is not defined or settings == deployment_settings
+        fail_msg: Run the complete application profile with unchanged settings throughout this deployment.
+
+    - name: Define controller-side state and common resource tags
+      ansible.builtin.set_fact:
+        deployment_settings: "{{ settings }}"
+        project_state_dir: "{{ deployment_repo_dir }}/state"
+        project_resource_prefix: "{{ settings.project_name }}-{{ settings.environment_name }}"
+        project_tags:
+          Project: "{{ settings.project_name }}"
+          Environment: "{{ settings.environment_name }}"
+          ManagedBy: Ansible
+
+    - name: Require the database secret before changing application configuration
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length >= 8
+          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length <= 41
+          - "'/' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+          - "'\"' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+          - "'@' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
+        fail_msg: Set RDS_MASTER_PASSWORD on the controller before configuring the application.
+      no_log: true
+
+    - name: Read the actual deployment outputs
+      ansible.builtin.include_vars:
+        file: "{{ project_state_dir }}/deployment.json"
+        name: deployment
+
+    - name: Require a manifest belonging to the selected environment
+      ansible.builtin.assert:
+        that:
+          - deployment.schema_version == 1
+          - deployment.project_name == settings.project_name
+          - deployment.environment_name == settings.environment_name
+          - deployment.aws_region == settings.aws_region
+          - deployment.expected.profile | default('') == 'complete_application'
+          - deployment.resources.ec2_instance_ids | length == settings.ec2_instance_count | default(1) | int
+        fail_msg: The deployment manifest does not match the selected environment. Run deploy.yml.
+
+    - name: Inspect only the exact recorded application instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ settings.aws_region }}"
+        instance_ids: "{{ deployment.resources.ec2_instance_ids }}"
+      register: app_targets
+
+    - name: Require exactly the recorded application servers to be returned by AWS
+      ansible.builtin.assert:
+        that:
+          - app_targets.instances | length == deployment.resources.ec2_instance_ids | length
+          - app_targets.instances | map(attribute='instance_id') | difference(deployment.resources.ec2_instance_ids) | length == 0
+        fail_msg: AWS did not return exactly the recorded application servers. No software was changed.
+
+    - name: Require that the recorded instance still belongs to this application
+      ansible.builtin.assert:
+        that:
+          - item.state.name == 'running'
+          - item.tags.Project | default('') == settings.project_name
+          - item.tags.Environment | default('') == settings.environment_name
+          - item.tags.Role | default('') == 'application'
+          - item.tags.ManagedBy | default('') == 'Ansible'
+          - item.public_ip_address is defined
+        fail_msg: Refusing to configure an instance without the selected project, environment and application role tags.
+      loop: "{{ app_targets.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+
+    - name: Populate an explicit application-only in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ item.instance_id }}"
+        groups: project_application_servers
+        ansible_host: "{{ item.public_ip_address }}"
+        ansible_user: "{{ settings.ssh_username | default('ec2-user') }}"
+        ansible_ssh_private_key_file: "{{ settings.ssh_private_key_file | expanduser }}"
+        ansible_ssh_common_args: -o StrictHostKeyChecking=accept-new
+        deployment_settings: "{{ settings }}"
+        deployment_outputs: "{{ deployment }}"
+      loop: "{{ app_targets.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+
+- name: Install the team's Apache and PHP example on the selected application servers
+  hosts: project_application_servers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Start this server's setup with an incomplete status
+      ansible.builtin.set_fact:
+        project_application_setup_complete: false
+
+    - name: Wait for the application server SSH connection
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Gather operating system facts
+      ansible.builtin.setup:
+        gather_subset: [min]
+
+    - name: Stop before package changes on unsupported operating systems
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Amazon'
+          - ansible_facts.distribution_major_version == '2023'
+        fail_msg: This first software template supports Amazon Linux 2023 only.
+
+    - name: Install Apache, PHP and required extensions
+      ansible.builtin.dnf:
         name:
           - httpd
           - php
-          - php-mysqli
-          - php-xml      
-          - php-mbstring 
-          - unzip        
+          - php-mysqlnd
+          - php-xml
+          - php-mbstring
+          - unzip
+          - acl
         state: present
 
-    - name: Start and enable Apache service
-      ansible.builtin.systemd:
-        name: httpd
-        state: started
-        enabled: true
-
-    - name: Install PHP Composer globally
-      ansible.builtin.shell: curl -sS https://getcomposer.org/installer | php && mv composer.phar /usr/local/bin/composer
-      args:
-        creates: /usr/local/bin/composer
-
-    - name: Ensure correct permissions on web directory
+    - name: Create the application directory
       ansible.builtin.file:
         path: /var/www/html
         owner: apache
         group: apache
-        mode: '0775'
+        mode: '0755'
         state: directory
 
-    - name: Install AWS SDK for PHP via Composer
-      become_user: apache
-      ansible.builtin.command: /usr/local/bin/composer require aws/aws-sdk-php
-      args:
-        chdir: /var/www/html
-        creates: /var/www/html/vendor/autoload.php
+    - name: Create a nonpublic configuration directory
+      ansible.builtin.file:
+        path: /etc/aws-project
+        owner: root
+        group: apache
+        mode: '0750'
+        state: directory
 
-    - name: Deploy the Media Gallery PHP Application
+    - name: Write the actual application connections outside the public web directory
       ansible.builtin.copy:
-        dest: /var/www/html/index.php
+        dest: /etc/aws-project/app-config.json
+        owner: root
+        group: apache
+        mode: '0640'
+        content: >-
+          {{ {
+            's3_bucket_name': deployment_outputs.resources.s3_bucket_name,
+            'db_endpoint': deployment_outputs.resources.rds_endpoint,
+            'db_port': deployment_outputs.resources.rds_port,
+            'db_name': deployment_settings.db_name,
+            'db_user': deployment_settings.db_username,
+            'db_password': lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD'),
+            'region': deployment_outputs.aws_region
+          } | to_nice_json }}
+      no_log: true
+
+    - name: Fetch the Composer installer signature using TLS
+      ansible.builtin.uri:
+        url: https://composer.github.io/installer.sig
+        return_content: true
+      register: composer_signature
+
+    - name: Download the Composer installer and verify its published checksum
+      ansible.builtin.get_url:
+        url: https://getcomposer.org/installer
+        dest: /usr/local/src/composer-setup.php
+        mode: '0644'
+        checksum: "sha384:{{ composer_signature.content | trim }}"
+
+    - name: Install Composer
+      ansible.builtin.command:
+        argv:
+          - php
+          - /usr/local/src/composer-setup.php
+          - --install-dir=/usr/local/bin
+          - --filename=composer
+        creates: /usr/local/bin/composer
+
+    - name: Prepare the application Composer cache
+      ansible.builtin.file:
+        path: /var/cache/aws-project-composer
+        owner: apache
+        group: apache
+        mode: '0750'
+        state: directory
+
+    - name: Declare this template AWS SDK dependency
+      ansible.builtin.copy:
+        dest: /var/www/html/composer.json
         owner: apache
         group: apache
         mode: '0644'
         content: |
+          {"require":{"aws/aws-sdk-php":"^3.0"}}
+
+    - name: Install the application PHP dependency
+      become_user: apache
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/composer
+          - install
+          - --no-dev
+          - --prefer-dist
+          - --no-interaction
+          - --no-progress
+        chdir: /var/www/html
+        creates: /var/www/html/vendor/autoload.php
+      environment:
+        COMPOSER_HOME: /var/cache/aws-project-composer
+
+    - name: Deploy the existing gallery demonstration using actual connection settings
+      ansible.builtin.copy:
+        dest: /var/www/html/index.php
+        owner: root
+        group: apache
+        mode: '0644'
+        content: |
           <?php
+          // Existing team gallery example; connection values come from this deployment.
           require 'vendor/autoload.php';
+          $config = json_decode(file_get_contents('/etc/aws-project/app-config.json'), true, 512, JSON_THROW_ON_ERROR);
           use Aws\S3\S3Client;
           use Aws\Exception\AwsException;
 
-          $s3_bucket = '{{ s3_bucket_name }}';
-          $db_endpoint = '{{ db_endpoint }}';
-          $db_user = '{{ db_user }}';
-          $db_pass = '{{ db_password }}';
-          
-          $mysqli = new mysqli($db_endpoint, $db_user, $db_pass, "", {{ db_port }});
-          if ($mysqli->connect_error) die("Database connection failed: " . $mysqli->connect_error);
+          $s3_bucket = $config['s3_bucket_name'];
+          $db_endpoint = $config['db_endpoint'];
+          $db_user = $config['db_user'];
+          $db_pass = $config['db_password'];
 
-          $mysqli->query("CREATE DATABASE IF NOT EXISTS gallery_db");
-          $mysqli->select_db("gallery_db");
+          try {
+              $mysqli = new mysqli($db_endpoint, $db_user, $db_pass, $config['db_name'], $config['db_port']);
+          } catch (mysqli_sql_exception $e) {
+              http_response_code(503);
+              exit('Application database unavailable. Check the deployment report and server logs.');
+          }
           $mysqli->query("CREATE TABLE IF NOT EXISTS uploads (
               id INT AUTO_INCREMENT PRIMARY KEY,
               title VARCHAR(255) NOT NULL,
@@ -80,7 +257,7 @@
               upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )");
 
-          $s3 = new S3Client(['region' => '{{ region }}', 'version' => 'latest']);
+          $s3 = new S3Client(['region' => $config['region'], 'version' => 'latest']);
 
           // Handle POST Actions (Upload, Edit, Delete)
           if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -104,7 +281,7 @@
               elseif ($action === 'delete' && isset($_POST['id'], $_POST['s3_key'])) {
                   $id = (int)$_POST['id'];
                   $s3_key = $_POST['s3_key'];
-                  
+
                   try {
                       // Delete physical file from S3 bucket
                       $s3->deleteObject(['Bucket' => $s3_bucket, 'Key' => $s3_key]);
@@ -124,14 +301,14 @@
               }
           }
           ?>
-          
+
           <!DOCTYPE html>
           <html>
           <head><title>Secure Media Gallery</title></head>
           <body style="font-family: Arial; padding: 20px;">
               <h2>Secure Media Gallery</h2>
               <?= isset($msg) ? $msg : "" ?>
-              
+
               <form method="post" enctype="multipart/form-data" style="background:#f4f4f4; padding:20px; width:400px; border-radius:5px;">
                   <input type="hidden" name="action" value="upload">
                   <label><b>Image Title:</b></label><br>
@@ -151,15 +328,15 @@
                       $request = $s3->createPresignedRequest($cmd, '+15 minutes');
                       $presignedUrl = (string)$request->getUri();
                       $ext = strtolower(pathinfo($row['s3_key'], PATHINFO_EXTENSION));
-                      
+
                       echo "<div style='border:1px solid #ccc; padding:15px; border-radius:5px; background:#fafafa; width: 280px;'>";
-                      
+
                       if (in_array($ext, ['mp4', 'webm', 'ogg', 'mov'])) {
                           echo "<video src='{$presignedUrl}' controls style='max-width:100%; display:block; margin-bottom:10px;'></video>";
                       } else {
                           echo "<img src='{$presignedUrl}' style='max-width:100%; display:block; margin-bottom:10px;' />";
                       }
-                      
+
                       // Edit Form
                       echo "<form method='post' style='margin-bottom:10px;'>";
                       echo "<input type='hidden' name='action' value='edit'>";
@@ -167,9 +344,9 @@
                       echo "<input type='text' name='new_title' value='" . htmlspecialchars($row['title'], ENT_QUOTES) . "' required style='width:70%;'>";
                       echo "<button type='submit' style='width:25%; margin-left:2%; background:#28a745; color:white; border:none; cursor:pointer;'>Save</button>";
                       echo "</form>";
-                      
+
                       echo "<small style='color:gray; display:block; margin-bottom:10px;'>Uploaded: " . $row['upload_date'] . "</small>";
-                      
+
                       // Delete Form
                       echo "<form method='post' onsubmit=\"return confirm('Are you sure you want to delete this file? This will remove it from S3 permanently.');\">";
                       echo "<input type='hidden' name='action' value='delete'>";
@@ -177,10 +354,42 @@
                       echo "<input type='hidden' name='s3_key' value='" . htmlspecialchars($row['s3_key'], ENT_QUOTES) . "'>";
                       echo "<button type='submit' style='width:100%; padding:5px; background:#dc3545; color:white; border:none; border-radius:3px; cursor:pointer;'>Delete Media</button>";
                       echo "</form>";
-                      
+
                       echo "</div>";
                   }
                   ?>
               </div>
           </body>
           </html>
+
+    - name: Enable PHP and the Apache web service
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: [php-fpm, httpd]
+
+    - name: Record successful software installation
+      ansible.builtin.set_fact:
+        project_application_setup_complete: true
+
+- name: Record application setup only after every selected server succeeds
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require successful setup on every selected application server
+      ansible.builtin.assert:
+        that:
+          - groups.project_application_servers | default([]) | length == hostvars.localhost.deployment.resources.ec2_instance_ids | length
+          - groups.project_application_servers | map('extract', hostvars, 'project_application_setup_complete') | select('equalto', true) | list | length == groups.project_application_servers | length
+        fail_msg: Application setup did not finish on every selected server. The manifest remains marked incomplete.
+
+    - name: Mark the saved application setup complete without storing secrets
+      ansible.builtin.copy:
+        dest: "{{ project_state_dir }}/deployment.json"
+        mode: '0600'
+        content: >-
+          {{ deployment | combine({
+            'expected': deployment.expected | combine({'application_configured': true})
+          }) | to_nice_json }}

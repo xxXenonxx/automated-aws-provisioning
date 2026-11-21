@@ -27,7 +27,7 @@
 
     - name: Show the fresh verification report location
       ansible.builtin.debug:
-        msg: "Read report.html and report.json in {{ project_report_dir | default(verification_repo_dir ~ '/reports') }}. Application software is not installed or tested by the root provisioning workflow."
+        msg: "Read report.html and report.json in {{ project_report_dir | default(verification_repo_dir ~ '/reports') }}. The report shows the checks completed for the selected setup."
       when: root_verification.rc in [0, 1]
 
     - name: Explain when no fresh report could be produced

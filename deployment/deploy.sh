@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run by the user in the prepared EC2 controller's interactive terminal.
+# Run the project from the EC2 controller terminal.
 # Never supply the database password as a command argument or a saved file.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     printf '%s\n' 'Run this script with bash; do not source it.' >&2
@@ -11,7 +11,7 @@ umask 077
 
 if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then
     printf '%s\n' \
-        'Usage: bash tools/run_approved_demo.sh [--limit MONTHLY_USD]' \
+        'Usage: bash deploy.sh [--limit MONTHLY_USD]' \
         'Run in the prepared EC2 controller terminal as ec2-user.' \
         'Validates local inputs, then asks for the database password twice.' \
         'Choose the monthly forecast ceiling after reviewing the calculated estimate.' \
@@ -29,8 +29,7 @@ if [[ "$(uname -s)" != Linux || ! -t 0 || ! -t 1 || ! -t 2 ]]; then
     printf '%s\n' 'Use an interactive Linux terminal on the prepared EC2 controller; piped input is rejected.' >&2
     exit 1
 fi
-# The reviewed controller is a standard AL2023 EC2 host, not a CloudShell or
-# container execution environment. This check makes no AWS or metadata calls.
+# Require an EC2 controller rather than CloudShell.
 if [[ ! -r /sys/devices/virtual/dmi/id/sys_vendor ]] || \
     [[ "$(cat /sys/devices/virtual/dmi/id/sys_vendor)" != 'Amazon EC2' ]] || \
     [[ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ]]; then
@@ -48,7 +47,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-REPO_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
+REPO_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 cd "$REPO_DIR"
 exec 9>"$REPO_DIR/.deployment.lock"
 if ! flock -n 9; then
@@ -56,7 +55,7 @@ if ! flock -n 9; then
     exit 1
 fi
 for required in config/environment.json config/cost-assumptions.json \
-    tools/project_checks.py tools/cost_estimate.py validated-site.yml; do
+    tools/project_checks.py tools/cost_estimate.py deploy.yml; do
     if [[ ! -f "$required" || ! -r "$required" ]]; then
         printf 'Missing readable project input: %s\n' "$required" >&2
         exit 1
@@ -81,7 +80,6 @@ printf '%s\n' 'Checking local deployment inputs before requesting the database p
 "$PYTHON" tools/project_checks.py validate --config config/environment.json
 "$PYTHON" tools/cost_estimate.py validate \
     --config config/environment.json --assumptions config/cost-assumptions.json
-"$PLAYBOOK" validated-site.yml --syntax-check
 
 if [[ -z "$reviewed_monthly_limit" ]]; then
     IFS= read -r -p 'After reviewing the estimate, enter your maximum monthly forecast in USD: ' reviewed_monthly_limit
@@ -121,4 +119,4 @@ unset approved_demo_confirmation
 # A shell environment assignment reaches only this Ansible child. The password
 # is not an argument, an extra variable, a printed message or a stored file.
 RDS_MASTER_PASSWORD="$approved_demo_password" \
-    "$PLAYBOOK" validated-site.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
+    "$PLAYBOOK" -i localhost, deploy.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
