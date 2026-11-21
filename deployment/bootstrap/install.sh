@@ -4,7 +4,7 @@ set -euo pipefail
 umask 022
 
 if [[ "${EUID}" -ne 0 ]]; then
-    printf '%s\n' 'Run this bootstrap as root (EC2 user data runs as root).' >&2
+    printf '%s\n' 'Run with sudo bash bootstrap/install.sh.' >&2
     exit 1
 fi
 
@@ -20,7 +20,6 @@ python3.11 -m venv /opt/aws-project-venv
 /opt/aws-project-venv/bin/python -m pip install --upgrade pip
 /opt/aws-project-venv/bin/python -m pip install -r "$PROJECT_DIR/requirements.txt"
 
-install -d -m 0750 -o ec2-user -g ec2-user /home/ec2-user/aws-project
 install -d -m 0750 -o ec2-user -g ec2-user /home/ec2-user/.ansible
 if ! runuser -u ec2-user -- env HOME=/home/ec2-user \
     /opt/aws-project-venv/bin/ansible-galaxy collection install \
