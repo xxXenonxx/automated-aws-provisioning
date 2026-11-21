@@ -58,7 +58,7 @@
           - deployment.aws_region == settings.aws_region
           - deployment.expected.profile | default('') == 'complete_application'
           - deployment.resources.ec2_instance_ids | length == settings.ec2_instance_count | default(1) | int
-        fail_msg: The deployment manifest does not match the selected environment. Run validated-site.yml.
+        fail_msg: The deployment manifest does not match the selected environment. Run deploy.yml.
 
     - name: Inspect only the exact recorded application instance
       amazon.aws.ec2_instance_info:

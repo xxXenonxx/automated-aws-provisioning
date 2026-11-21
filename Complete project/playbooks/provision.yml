@@ -41,7 +41,7 @@
         that:
           - project_identity.account is defined
           - project_azs.availability_zones | default([]) | length >= 2
-        fail_msg: Run validated-site.yml to check, price and approve this complete deployment first.
+        fail_msg: Run deploy.yml to check, price and approve this complete deployment first.
 
     - name: Create the project VPC
       amazon.aws.ec2_vpc_net:

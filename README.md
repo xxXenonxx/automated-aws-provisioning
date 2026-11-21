@@ -1,307 +1,86 @@
-# Automated AWS Infrastructure Provisioning
+# Automated AWS Provisioning with Ansible
 
-## 1. Project Overview
+The project creates an application network, one or more EC2 application servers, a private MySQL database and a private S3 bucket. Ansible installs the Apache/PHP example application on each server. The workflow checks the request, estimates its monthly cost, asks for approval, deploys and generates HTML reports.
 
-This project automates the provisioning and cleanup of AWS infrastructure using Ansible playbooks. It reduces repetitive manual configuration and makes resource deployment more consistent and repeatable.
+## Files to use
 
-The project currently automates:
+| File | Purpose |
+| --- | --- |
+| `deployment/bootstrap/install.sh` | Install Python, Ansible and the AWS collection on the controller. |
+| `deployment/config/environment.demo.json` | Starting settings for the two-server demonstration. |
+| `deployment/config/environment.json` | Your prepared settings; generated locally and excluded from Git. |
+| `deployment/config/cost-assumptions.json` | Expected usage for the estimate; generated locally and excluded from Git. |
+| `deployment/tools/demo.py` | Short commands to prepare settings, estimate cost and copy reports. |
+| `deployment/deploy.sh` | Ask for approval/password and run the deployment. |
+| `deployment/deploy.yml` | Ansible workflow: checks, cost, network/resources, software and final checks. |
+| `Complete project/playbooks/provision.yml` | Team network and resource creation. |
+| `Complete project/playbooks/configure.yml` | Team application installation. |
+| `Complete project/playbooks/cleanup.yml` | Cleanup using the saved deployment resource IDs. |
 
-- **Security Groups:** Creates a security group for project resources.
-- **Amazon S3:** Creates an S3 bucket with versioning, server-side encryption, and public access blocking.
-- **Amazon EC2:** Launches an EC2 instance using the configured AMI, subnet, security group, and key pair.
-- **Key Pair Management:** Creates an AWS EC2 key pair and saves its private key locally.
-- **Cleanup:** Removes the project's EC2 instance, S3 bucket and its object versions, security group, and AWS key-pair registration.
+The remaining Python files in `deployment/tools` implement pricing, checks, resource ownership and reporting. Users do not run each file separately. The original root `site.yml` and `playbooks/` are retained for the earlier resource-only version; use `deployment/deploy.sh` for the complete application workflow.
 
-## 2. Project Structure
+## Controller setup
 
-```text
-automated-aws-provisioning/
-├── playbooks/
-│   ├── security_groups.yml
-│   ├── s3.yml
-│   ├── ec2.yml
-│   ├── key_pair.yml
-│   └── cleanup.yml
-├── inventory/
-│   └── inventory.ini
-├── group_vars/
-├── site.yml
-├── .gitignore
-└── README.md
-```
+Launch one Amazon Linux 2023 x86 EC2 controller with a public IPv4 address and the `ProjectControlRole` instance profile. For the supplied demo use `t3.micro`, an 8 GiB gp3 disk and one dedicated security group with outbound access. Connect through Session Manager. The application servers use the separate `ProjectAppRole` instance profile, scoped to the chosen bucket. Both roles must already exist.
 
-The `site.yml` file is the master playbook. It imports the security group, S3, and EC2 playbooks in sequence. The key-pair and cleanup playbooks are run separately.
-
-## 3. Prerequisites
-
-Before running the project, ensure that you have:
-
-- An AWS account.
-- AWS CLI installed and configured.
-- Ansible installed.
-- The `amazon.aws` Ansible collection installed.
-- An IAM identity with sufficient permissions to manage the required AWS resources.
-- Access to the Git repository.
-
-This project uses AWS region `us-east-1` (US East, N. Virginia).
-
-### Install the required Ansible collection
-
-Run in your Ubuntu terminal:
+Run the user switch separately, then continue as `ec2-user`:
 
 ```bash
-ansible-galaxy collection install amazon.aws
+sudo -iu ec2-user
 ```
-
-Check the installation:
 
 ```bash
-ansible-galaxy collection list
+sudo dnf install -y git
 ```
-
-### Configure AWS credentials
-
-Configure credentials using:
 
 ```bash
-aws configure
+git clone -b ahmed/checked-aws-provisioning \
+  https://github.com/xxXenonxx/automated-aws-provisioning.git ~/aws-project-video
 ```
-
-Enter the access key, secret key, default region (`us-east-1`), and output format when prompted.
-
-Verify that the credentials work:
 
 ```bash
-aws sts get-caller-identity --no-cli-pager
+sudo bash ~/aws-project-video/deployment/bootstrap/install.sh
 ```
-
-**Security:** Never commit AWS credentials, access keys, secret keys, or private SSH keys to GitHub. Use an IAM identity with only the permissions required by the project.
-
-## 4. Open the Project
-
-Navigate to the repository directory:
 
 ```bash
-cd ~/projects/automated-aws-provisioning-github
+cd ~/aws-project-video/deployment
+source /opt/aws-project-venv/bin/activate
 ```
 
-Open it in VS Code:
+## Prepare, estimate and deploy
 
 ```bash
-code .
+python tools/demo.py prepare
 ```
 
-Run the following commands from the repository root unless otherwise stated.
-
-## 5. Validate the Playbooks
-
-Before provisioning resources, check the YAML syntax:
+Preparation uses the demo defaults, fills the controller address/security group, formats the bucket name with your AWS account ID and prepares the application SSH key. It creates no application infrastructure. Existing local settings are retained. Change only the application count with `python tools/demo.py prepare --servers 2`, or edit `config/environment.json` before estimating. Defaults and IAM permissions must match your account and region.
 
 ```bash
-ansible-playbook playbooks/key_pair.yml --syntax-check
-ansible-playbook site.yml --syntax-check
-ansible-playbook playbooks/cleanup.yml --syntax-check
+python tools/demo.py estimate
 ```
 
-Each command should complete without syntax errors.
-
-## 6. Provision AWS Resources
-
-Run the playbooks in the following order.
-
-### Step 1: Create the EC2 key pair
+Review the combined monthly forecast, then start deployment:
 
 ```bash
-ansible-playbook playbooks/key_pair.yml
+bash deploy.sh
 ```
 
-This playbook creates or checks the AWS key-pair registration and saves the private key locally when AWS returns it.
+Enter the accepted monthly forecast limit and the database password twice at the hidden prompts. The workflow refreshes the forecast and stops before provisioning if it exceeds the approved amount. This limit is not an AWS billing cap. On a rerun, use the database's existing password.
 
-The configured key-pair name is:
+The two-server demo creates `automated-aws-provisioning-video-web` and `automated-aws-provisioning-video-web-02`, alongside the separate controller. Both receive the same software and share the database/bucket. Each server has its own address and disk. This is an initial server-count choice, not automatic scaling or load balancing.
 
-```text
-automated-aws-project-key
-```
+## Reports
 
-The expected local private-key path is:
-
-```text
-~/.ssh/automated-aws-project-key.pem
-```
-
-The private key must remain outside the repository. AWS does not allow an existing private key to be downloaded again. If the AWS key pair already exists but its private key is unavailable locally, resolve that situation before launching EC2.
-
-### Step 2: Run the master playbook
+The deployment writes `reports/cost-estimate.html` and `reports/report.html` on the controller. To download them through CloudShell, clone the same branch there and run:
 
 ```bash
-ansible-playbook site.yml
+python3 ~/aws-project-video/deployment/tools/demo.py download
 ```
 
-The master playbook executes:
+For the estimate before deployment use `download --cost-only`. If more than one controller matches, add `--controller INSTANCE_ID`. If boto3 is unavailable in CloudShell, install it with `python3 -m pip install --user boto3`.
 
-1. `playbooks/security_groups.yml`
-2. `playbooks/s3.yml`
-3. `playbooks/ec2.yml`
+In CloudShell choose **Actions > Download file** and enter `/home/cloudshell-user/project-reports/cost-estimate.html` or `/home/cloudshell-user/project-reports/report.html`. The copy command only reads the generated HTML reports; it does not create a public report site.
 
-The playbooks use the configured AWS credentials and region to manage the resources.
+## Cleanup
 
-### Step 3: Verify the resources
-
-Check EC2 instances:
-
-```bash
-aws ec2 describe-instances \
-  --region us-east-1 \
-  --filters Name=tag:Name,Values=ansible-project-ec2 \
-  --query 'Reservations[].Instances[].[InstanceId,State.Name]' \
-  --output table \
-  --no-cli-pager
-```
-
-Check the security group:
-
-```bash
-aws ec2 describe-security-groups \
-  --region us-east-1 \
-  --group-names ansible-project-test \
-  --query 'SecurityGroups[].[GroupId,GroupName]' \
-  --output table \
-  --no-cli-pager
-```
-
-Check S3 buckets:
-
-```bash
-aws s3 ls
-```
-
-The S3 playbook generates a bucket name using the configured prefix, AWS account ID, region, and a random suffix.
-
-To inspect bucket encryption or versioning, substitute the actual bucket name:
-
-```bash
-aws s3api get-bucket-versioning \
-  --bucket YOUR_BUCKET_NAME \
-  --region us-east-1
-
-aws s3api get-bucket-encryption \
-  --bucket YOUR_BUCKET_NAME \
-  --region us-east-1
-```
-
-## 7. Run Individual Playbooks
-
-Each resource playbook can be executed independently when needed:
-
-```bash
-ansible-playbook playbooks/security_groups.yml
-ansible-playbook playbooks/s3.yml
-ansible-playbook playbooks/ec2.yml
-```
-
-Run the key-pair playbook separately before EC2 provisioning if the required AWS key pair is not available.
-
-The master playbook does not include key-pair creation or cleanup.
-
-## 8. Clean Up AWS Resources
-
-**Warning: Cleanup is destructive.** It terminates matching EC2 instances and permanently deletes matching project S3 buckets and their object versions. Back up any data you need before proceeding.
-
-Run:
-
-```bash
-ansible-playbook playbooks/cleanup.yml
-```
-
-The cleanup playbook attempts to:
-
-1. Find project EC2 instances by their `Name` tag and terminate them.
-2. Find S3 buckets matching the configured project bucket prefix and delete them, including their object versions.
-3. Delete the project security group.
-4. Delete the AWS key-pair registration.
-
-The local private-key file is not deleted.
-
-Review the cleanup playbook's region, instance name, bucket prefix, security group name, and key-pair name before execution. The current configuration is intended for the project resources in `us-east-1` and the specified AWS account.
-
-### Verify cleanup
-
-Check for remaining project EC2 instances:
-
-```bash
-aws ec2 describe-instances \
-  --region us-east-1 \
-  --filters Name=tag:Name,Values=ansible-project-ec2 \
-            Name=instance-state-name,Values=pending,running,stopping,stopped \
-  --query 'Reservations[].Instances[].[InstanceId,State.Name]' \
-  --output table \
-  --no-cli-pager
-```
-
-Also check the S3 console, EC2 security groups, EBS volumes, Elastic IP addresses, and AWS Billing dashboard.
-
-A successful Ansible recap does not by itself prove that every resource in the AWS account has been removed.
-
-## 9. Understanding Ansible Output
-
-Ansible reports the result of each task:
-
-- `ok`: The task ran successfully without changing the resource.
-- `changed`: Ansible created, updated, or removed a resource.
-- `skipping`: The task's condition was not met, so it did not run.
-- `failed`: The task encountered an error.
-- `unreachable`: Ansible could not connect to the target.
-
-Warnings about an absent inventory and implicit localhost can occur because these playbooks execute AWS API operations from the local machine using `hosts: localhost` and `connection: local`. They do not automatically indicate a failure.
-
-## 10. Cost and Security Considerations
-
-- EC2 instances can incur compute charges while running. Stopping an instance may still leave charges for EBS storage and other associated resources.
-- S3 storage, requests, and retained object versions may incur charges.
-- Security groups and EC2 key-pair registrations do not normally have direct recurring charges.
-- Terminating an instance does not guarantee that every associated resource is deleted.
-- Check all AWS regions and services for resources not managed by these playbooks.
-- Review the AWS Billing dashboard for current charges and any remaining resources.
-- Keep SSH access restricted to trusted source IP addresses.
-- Do not expose private SSH keys or AWS credentials in source control.
-
-## 11. Troubleshooting
-
-### Access denied
-
-If AWS returns `AccessDenied`, check the IAM permissions attached to the configured identity and add only the missing permissions required by the task.
-
-### Key pair already exists
-
-AWS cannot return the private key for an existing key pair. If the corresponding local private key is missing, create a new AWS key pair under a different name, save its private key securely, and update `ec2.yml` to use the new name.
-
-### EC2 instance not found during cleanup
-
-The cleanup playbook searches by the configured `Name` tag and region. If the termination task is skipped, verify the instance ID, region, AWS account, and resource tags before assuming the instance has been removed.
-
-### S3 bucket deletion fails
-
-A versioned bucket can contain object versions and delete markers even when its normal object listing appears empty. Inspect the error and remaining bucket contents before retrying.
-
-### Playbook fails because of permissions
-
-Check the failed task and the AWS error message. Confirm that the selected IAM identity has the necessary EC2, S3, and security group permissions.
-
-## 12. Typical Workflow
-
-For a normal provisioning test:
-
-```bash
-cd ~/projects/automated-aws-provisioning-github
-
-ansible-playbook playbooks/key_pair.yml
-ansible-playbook site.yml
-```
-
-Verify the resources in AWS, then clean up when finished:
-
-```bash
-ansible-playbook playbooks/cleanup.yml
-```
-
-Always verify the final resource state in AWS after cleanup.
+Keep the controller and its local `deployment/state/deployment.json` until the reports are downloaded and cleanup is reviewed. The complete cleanup playbook checks the exact saved resource IDs and asks for explicit confirmation. Database snapshot handling must be selected before deletion. No cleanup is performed by preparation, estimation or report download.

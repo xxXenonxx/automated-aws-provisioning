@@ -15,15 +15,15 @@
         file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
         name: deployment_settings
 
-    - name: Choose the existing team architecture or existing-network mode
+    - name: Select the complete application workflow
       ansible.builtin.set_fact:
         deployment_workflow: "{{ deployment_settings.profile | default('complete_application') }}"
 
     - name: Require a supported workflow
       ansible.builtin.assert:
         that:
-          - deployment_workflow in ['complete_application', 'resource_provisioning']
-        fail_msg: Choose complete_application for the team's full network and application, or resource_provisioning for an existing network.
+          - deployment_workflow == 'complete_application'
+        fail_msg: Use complete_application for the project network and application.
 
 - name: Check the selected setup before creation
   ansible.builtin.import_playbook: playbooks/preflight.yml
@@ -73,21 +73,11 @@
         deployment_creation_approved: true
         deployment_approved_cost_sha256: "{{ deployment_cost_estimate_sha256 }}"
 
-- name: Run the existing root provisioning workflow
-  ansible.builtin.import_playbook: site.yml
-  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
-
 - name: Run the team's complete network and resource creation
   ansible.builtin.import_playbook: ../Complete project/playbooks/provision.yml
-  when: hostvars['localhost'].deployment_workflow == 'complete_application'
 
 - name: Install the team's existing application example
   ansible.builtin.import_playbook: ../Complete project/playbooks/configure.yml
-  when: hostvars['localhost'].deployment_workflow == 'complete_application'
-
-- name: Record actual outputs from that workflow
-  ansible.builtin.import_playbook: playbooks/capture_deployment.yml
-  when: hostvars['localhost'].deployment_workflow == 'resource_provisioning'
 
 - name: Check the created setup and generate its report
   ansible.builtin.import_playbook: playbooks/verify.yml

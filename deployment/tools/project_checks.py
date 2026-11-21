@@ -161,7 +161,7 @@ def validate_config(config):
     if "ssh_username" in config and not _matches(config["ssh_username"], r"[a-z_][a-z0-9_-]{0,31}"):
         error("ssh_username", "Use a Linux username such as ec2-user.")
     if "s3_bucket_name" in config and not _bucket_valid(config["s3_bucket_name"]):
-        error("s3_bucket_name", "Use a valid lowercase S3 bucket name (3–63 characters); its availability is checked against AWS.")
+        error("s3_bucket_name", "Use a valid lowercase S3 bucket name (3â€“63 characters); its availability is checked against AWS.")
     storage = config.get("db_allocated_storage")
     if "db_allocated_storage" in config and (type(storage) is not int or not 20 <= storage <= 65536):
         error("db_allocated_storage", "Use a whole number of GiB from 20 to 65536 for the supported MySQL setup.")
@@ -263,7 +263,7 @@ def validate_manifest(manifest):
     if (not isinstance(instance_ids, list) or not 1 <= len(instance_ids) <= 20
             or len(set(str(item) for item in instance_ids)) != len(instance_ids)
             or any(not _matches(item, r"i-(?:[0-9a-f]{8}|[0-9a-f]{17})") for item in instance_ids)):
-        errors.append("Provide 1–20 distinct provisioned EC2 instance identifiers.")
+        errors.append("Provide 1â€“20 distinct provisioned EC2 instance identifiers.")
     elif "ec2_count" in expected and len(instance_ids) != expected["ec2_count"]:
         errors.append("Recorded project-server identifiers must match the requested server count.")
     if not _bucket_valid(resources.get("s3_bucket_name")):
@@ -570,7 +570,7 @@ def _make_report(manifest, checks, sample, *, observed_addresses=None):
     report = {
         "schema_version": 1,
         "mode": "sample" if sample else "live_read_only",
-        "evidence_notice": ("SAMPLE — offline fixture data only. This report does not establish the state of any live AWS deployment." if sample else "Read-only observations at the recorded time. This is not a complete security audit or proof of application-data connectivity."),
+        "evidence_notice": ("SAMPLE â€” offline fixture data only. This report does not establish the state of any live AWS deployment." if sample else "Read-only observations at the recorded time. This is not a complete security audit or proof of application-data connectivity."),
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "deployment": {**{key: manifest[key] for key in ("project_name", "environment_name", "aws_region", "account_id")},
                        "workflow": "Resource creation only; application setup is not declared" if manifest["expected"].get("profile") == "resource_provisioning" else "Complete application workflow"},
@@ -778,7 +778,7 @@ def attach_cost_estimate(report, manifest, path=None):
     if (estimate["scope"]["profile"] != manifest_profile
             or estimate["scope"]["rds_multi_az"] != manifest["expected"].get("db_multi_az", False)):
         return unavailable("The estimate's network workflow or database availability differs from the recorded setup. No mismatched amount is shown.")
-    notice = ("SAMPLE COST ESTIMATE — demonstration prices only, even if resource checks use live AWS data." if estimate["sample_only"] else "ESTIMATE — AWS public list-price forecast, not an AWS bill or guaranteed charge.")
+    notice = ("SAMPLE COST ESTIMATE â€” demonstration prices only, even if resource checks use live AWS data." if estimate["sample_only"] else "ESTIMATE â€” AWS public list-price forecast, not an AWS bill or guaranteed charge.")
     report["cost_estimate"] = {"status": "estimated", "evidence_notice": notice, "sha256": expected_digest, "estimate": estimate}
     return report
 
@@ -1148,7 +1148,7 @@ def main(argv=None):
             import boto3
             from botocore.config import Config
         except ImportError:
-            print("Live checks need boto3. Install requirements-checks.txt in the Linux control-node environment first.", file=sys.stderr)
+            print("Live checks need boto3. Install requirements.txt in the Linux control-node environment first.", file=sys.stderr)
             return 2
         try:
             session = boto3.Session(region_name=manifest["aws_region"])
