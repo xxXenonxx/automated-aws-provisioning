@@ -1,149 +1,67 @@
 ---
-- name: Provision an Amazon RDS MySQL database
+- name: Create the private MySQL database
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-    vpc_id: "vpc-0d347abaa076d4f22"
-
-    db_identifier: automated-aws-project-db
-    db_name: projectdb
-    db_master_username: projectadmin
-    db_master_password: "{{ lookup('env', 'RDS_MASTER_PASSWORD') }}"
-
-    db_instance_class: db.t3.micro
-    db_engine: mysql
-    db_allocated_storage: 20
-    db_storage_type: gp3
-
-    db_subnet_group_name: automated-aws-project-db-subnets
-    db_security_group_name: automated-aws-project-db-sg
-
-    # Set this to the security group ID attached to the EC2 control node.
-    # Do not use the public IP address here.
-    control_node_security_group_id: sg-08f423d72c23364d4
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
   tasks:
-    - name: Require a database password from the environment
-      ansible.builtin.assert:
-        that:
-          - db_master_password | length >= 8
-          - db_master_password | length <= 41
-          - "'/' not in db_master_password"
-          - "not db_master_password is search(\"'\")"
-          - "'@' not in db_master_password"
-        fail_msg: >-
-          Set RDS_MASTER_PASSWORD in the shell environment before running
-          this playbook. Use 8-41 characters and avoid /, double quote,
-          and @ characters.
-
-    - name: Require the control node security group ID to be configured
-      ansible.builtin.assert:
-        that:
-          - control_node_security_group_id is match('^sg-[0-9a-f]+$')
-        fail_msg: >-
-          Replace control_node_security_group_id with the security group ID
-          attached to your EC2 control node.
-
-    - name: Find subnets in the project VPC
-      amazon.aws.ec2_vpc_subnet_info:
-        region: "{{ aws_region }}"
-        filters:
-          vpc-id: "{{ vpc_id }}"
-      register: project_vpc_subnets
-
-    - name: Select one subnet from each available Availability Zone
-      ansible.builtin.set_fact:
-        db_subnet_ids: >-
-          {{
-            project_vpc_subnets.subnets
-            | sort(attribute='availability_zone')
-            | groupby('availability_zone')
-            | map(attribute='1')
-            | map('first')
-            | map(attribute='subnet_id')
-            | list
-          }}
-
-    - name: Require at least two subnets in different Availability Zones
-      ansible.builtin.assert:
-        that:
-          - db_subnet_ids | length >= 2
-        fail_msg: >-
-          RDS needs a DB subnet group spanning at least two Availability Zones.
-          Check that the configured VPC has subnets in at least two AZs.
-
-    - name: Create the private database security group
+    - name: Allow database access only from this application security group
       amazon.aws.ec2_security_group:
-        name: "{{ db_security_group_name }}"
-        description: Allow MySQL only from the project EC2 control node
-        region: "{{ aws_region }}"
-        vpc_id: "{{ vpc_id }}"
+        name: "{{ project_resource_prefix }}-db"
+        description: MySQL only from this environment application servers
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
         rules:
           - proto: tcp
-            ports:
-              - 3306
-            group_id: "{{ control_node_security_group_id }}"
-            rule_desc: MySQL access from the Ansible control node
-        rules_egress: []
+            ports: [3306]
+            group_id: "{{ project_web_sg.group_id }}"
+        purge_rules: true
+        tags: "{{ project_tags }}"
         state: present
-        tags:
-          Project: automated-aws-provisioning
-          ManagedBy: Ansible
-          Purpose: Database
-      register: db_security_group
+      register: project_db_sg
 
-    - name: Create the RDS DB subnet group
+    - name: Create the private database subnet group
       amazon.aws.rds_subnet_group:
-        name: "{{ db_subnet_group_name }}"
-        description: Private subnets for the automated AWS provisioning project
-        region: "{{ aws_region }}"
-        subnets: "{{ db_subnet_ids }}"
+        name: "{{ project_resource_prefix }}-db-subnets"
+        region: "{{ settings.aws_region }}"
+        description: Two private project subnets for MySQL
+        subnets:
+          - "{{ project_private_a.subnet.id }}"
+          - "{{ project_private_b.subnet.id }}"
+        tags: "{{ project_tags }}"
         state: present
-        tags:
-          Project: automated-aws-provisioning
-          ManagedBy: Ansible
-      register: db_subnet_group
 
-    - name: Create the RDS MySQL database
+    - name: Create the private encrypted MySQL database
       amazon.aws.rds_instance:
-        db_instance_identifier: "{{ db_identifier }}"
-        engine: "{{ db_engine }}"
-        db_instance_class: "{{ db_instance_class }}"
-        allocated_storage: "{{ db_allocated_storage }}"
-        storage_type: "{{ db_storage_type }}"
-        db_name: "{{ db_name }}"
-        master_username: "{{ db_master_username }}"
-        master_user_password: "{{ db_master_password }}"
-        port: 3306
-        region: "{{ aws_region }}"
-        db_subnet_group_name: "{{ db_subnet_group_name }}"
-        vpc_security_group_ids:
-          - "{{ db_security_group.group_id }}"
-        publicly_accessible: false
-        multi_az: false
+        region: "{{ settings.aws_region }}"
+        db_instance_identifier: "{{ settings.rds_identifier }}"
+        db_instance_class: "{{ settings.db_instance_class }}"
+        db_name: "{{ settings.db_name }}"
+        engine: mysql
+        engine_version: "{{ deployment_rds_engine_version }}"
+        allocated_storage: "{{ settings.db_allocated_storage }}"
+        storage_type: gp3
         storage_encrypted: true
-        backup_retention_period: 0
+        master_username: "{{ settings.db_username }}"
+        master_user_password: "{{ lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') }}"
+        db_subnet_group_name: "{{ project_resource_prefix }}-db-subnets"
+        vpc_security_group_ids:
+          - "{{ project_db_sg.group_id }}"
+        publicly_accessible: false
+        multi_az: "{{ settings.db_multi_az }}"
+        backup_retention_period: 1
         auto_minor_version_upgrade: true
-        deletion_protection: false
+        copy_tags_to_snapshot: true
+        tags: "{{ project_tags }}"
         wait: true
         state: present
-        tags:
-          Project: automated-aws-provisioning
-          ManagedBy: Ansible
-          Purpose: Demonstration
-     # no_log: true
-      register: rds_result
-
-    - name: Display non-secret database details
-      ansible.builtin.debug:
-        msg:
-          - "DB identifier: {{ db_identifier }}"
-          - "Engine: {{ db_engine }}"
-          - "Database name: {{ db_name }}"
-          - "Instance class: {{ db_instance_class }}"
-          - "Publicly accessible: false"
-          - "DB subnet group: {{ db_subnet_group_name }}"
-          - "Database endpoint: {{ rds_result.endpoint.address | default('Check the RDS console') }}"
+      register: project_rds
+      no_log: true

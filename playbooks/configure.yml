@@ -9,7 +9,7 @@
   tasks:
     - name: Locate the shared deployment workflow
       ansible.builtin.set_fact:
-        deployment_repo_dir: "{{ playbook_dir | regex_replace('/Complete project/playbooks$', '/deployment') }}"
+        deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
 
     - name: Read the selected nonsecret environment settings
       ansible.builtin.include_vars:
@@ -58,7 +58,7 @@
           - deployment.aws_region == settings.aws_region
           - deployment.expected.profile | default('') == 'complete_application'
           - deployment.resources.ec2_instance_ids | length == settings.ec2_instance_count | default(1) | int
-        fail_msg: The deployment manifest does not match the selected environment. Run deploy.yml.
+        fail_msg: The deployment manifest does not match the selected environment. Run site.yml.
 
     - name: Inspect only the exact recorded application instance
       amazon.aws.ec2_instance_info:

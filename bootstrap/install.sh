@@ -42,4 +42,4 @@ runuser -u ec2-user -- env HOME=/home/ec2-user \
     /opt/aws-project-venv/bin/ansible-galaxy collection list amazon.aws
 printf '%s\n' \
     'Controller tools installed.' \
-    'Activate /opt/aws-project-venv, then run python tools/demo.py start from deployment.'
+    'Activate /opt/aws-project-venv, then run python tools/demo.py start from the project folder.'

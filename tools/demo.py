@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.parse
@@ -27,6 +29,35 @@ def save_json(path, value):
         json.dump(value, stream, indent=2)
         stream.write("\n")
     path.chmod(0o600)
+
+
+def migrate_local_files():
+    """Keep existing settings and resource IDs when updating the folder layout."""
+    old = BASE / "deployment"
+    copies = []
+    has_local_files = False
+    for folder in ("config", "state", "reports"):
+        for source in (old / folder).glob("*"):
+            if not source.is_file() or source.suffix not in (".json", ".html"):
+                continue
+            if folder == "config" and source.name not in ("environment.json", "cost-assumptions.json"):
+                continue
+            has_local_files = True
+            target = BASE / folder / source.name
+            if target.exists() and target.read_bytes() != source.read_bytes():
+                raise RuntimeError("Both layouts contain different local files. Keep the matching settings and state together before continuing.")
+            if not target.exists():
+                copies.append((source, target))
+    backup = BASE / ".previous-layout"
+    if has_local_files and backup.exists():
+        raise RuntimeError("A previous-layout backup already exists. Review the local deployment folders before updating.")
+    for source, target in copies:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(source, target)
+        target.chmod(0o600)
+    if has_local_files:
+        old.rename(backup)
+        print("Existing settings, deployment record and reports copied to the project folder. Original files kept as a backup.")
 
 
 def controller_id():
@@ -73,15 +104,8 @@ def prepare(args, session, settings=None, assumptions=None):
     found = ec2.describe_key_pairs(Filters=[{"Name": "key-name", "Values": [config["ec2_key_name"]]}])["KeyPairs"]
     if found and not key.is_file():
         raise RuntimeError("The AWS key pair exists but its private file is missing. Resolve it before deploying.")
-    if not found:
-        if key.exists():
-            raise RuntimeError("A local key file already exists. Review it before creating another key.")
-        key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        result = ec2.create_key_pair(KeyName=config["ec2_key_name"], KeyType="rsa", KeyFormat="pem")
-        fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(result.pop("KeyMaterial"))
-    key.chmod(0o600)
+    if not found and key.exists():
+        raise RuntimeError("A local key file already exists. Review it before creating another key.")
     save_json(target, config)
     save_json(usage, values)
     print("Settings ready:", target)
@@ -240,7 +264,62 @@ def estimate():
     playbook = Path("/opt/aws-project-venv/bin/ansible-playbook")
     if not playbook.is_file():
         raise RuntimeError("Install the controller tools with bootstrap/install.sh first.")
-    return subprocess.call([str(playbook), "-i", "localhost,", "playbooks/estimate_cost.yml"], cwd=BASE)
+    return subprocess.call([str(playbook), "-i", "inventory/inventory.ini", "playbooks/estimate_cost.yml"], cwd=BASE)
+
+
+def cleanup(args, session):
+    from resource_ownership import cleanup_plan
+    from project_checks import validate_config
+    config = read_json(BASE / "config/environment.json")
+    if validate_config(config):
+        raise RuntimeError("Use valid saved settings before previewing cleanup.")
+    account = session.client("sts").get_caller_identity()["Account"]
+    clients = {name: session.client(name) for name in ("sts", "ec2", "rds", "s3")}
+    plan = cleanup_plan(config, clients, account)
+    print("Cleanup preview | Account:", account, "| Environment:", config["environment_name"])
+    for name, value in plan["resources"].items():
+        if value:
+            print(name.replace("_", " ") + ":", ", ".join(value) if isinstance(value, list) else value)
+    print("The controller, IAM roles and SSH key are kept. Download any reports you need first.")
+    if not any(plan["resources"].values()):
+        print("No application resources remain for this environment.")
+        return 0
+    if not args.execute:
+        print("Nothing was deleted. To continue: python tools/demo.py cleanup --execute")
+        return 0
+    if not sys.stdin.isatty():
+        raise RuntimeError("Approve cleanup in an interactive controller terminal.")
+    import fcntl
+    with (BASE / ".deployment.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another deployment or cleanup is running. Wait until it finishes.") from None
+        keep_snapshot = True
+        if plan["resources"]["rds_identifier"]:
+            keep_snapshot = yes_no("Keep a final database snapshot (AWS storage charges may continue)", True)
+        if plan["resources"]["s3_bucket_name"] and not yes_no("Delete the bucket and ALL its files, versions and reports", False):
+            print("Cancelled. Nothing was deleted.")
+            return 0
+        if input("Type the environment name to delete it: ").strip() != config["environment_name"]:
+            print("Cancelled. Nothing was deleted.")
+            return 0
+        playbook = Path("/opt/aws-project-venv/bin/ansible-playbook")
+        if not playbook.is_file():
+            raise RuntimeError("Run cleanup on the prepared EC2 controller.")
+        request = {"confirm_cleanup": True, "delete_bucket_contents": True,
+                   "discard_database_snapshot": not keep_snapshot, "approved_cleanup_plan": plan,
+                   "cleanup_snapshot_name": config["rds_identifier"] + "-final-" + time.strftime("%Y%m%d%H%M%S", time.gmtime())}
+        (BASE / "state").mkdir(exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir=BASE / "state", delete=False, encoding="utf-8") as stream:
+            json.dump(request, stream)
+            request_path = Path(stream.name)
+        request_path.chmod(0o600)
+        try:
+            return subprocess.call([str(playbook), "-i", "inventory/inventory.ini", "playbooks/cleanup.yml",
+                                    "-e", "@" + str(request_path)], cwd=BASE)
+        finally:
+            request_path.unlink(missing_ok=True)
 
 
 def links(args, session):
@@ -290,6 +369,8 @@ def links(args, session):
     print("Quick-open links last up to", args.minutes, "minutes, or until the signing credentials expire.")
     for name, url in urls:
         print(name + ":\n" + url)
+    for url in manifest["resources"].get("website_urls", []):
+        print("Application:", url)
 
 
 def remote_read(ssm, instance_id, code):
@@ -312,7 +393,8 @@ def remote_read(ssm, instance_id, code):
 
 def copy_report(ssm, instance_id, directory, name, output):
     source = str(directory / "reports" / name)
-    prefix = "from pathlib import Path, PurePosixPath; b=Path(" + repr(source) + ").read_bytes(); "
+    legacy = str(directory / "deployment" / "reports" / name)
+    prefix = "from pathlib import Path; p=Path(" + repr(source) + "); b=(p if p.is_file() else Path(" + repr(legacy) + ")).read_bytes(); "
     size, digest = json.loads(remote_read(ssm, instance_id, prefix +
         "import hashlib,json; print(json.dumps([len(b),hashlib.sha256(b).hexdigest()]))"))
     if type(size) is not int or not 0 < size <= 2_000_000:
@@ -349,7 +431,7 @@ def download(args, session):
     if len(nodes) != 1:
         raise RuntimeError("Select one running ProjectControlRole controller with --controller INSTANCE_ID.")
     print("Controller:", nodes[0]["InstanceId"])
-    directory = PurePosixPath("/home/ec2-user/aws-project-video/deployment")
+    directory = PurePosixPath("/home/ec2-user/aws-project-video")
     names = ["cost-estimate.html"] if args.cost_only else ["cost-estimate.html", "report.html"]
     for name in names:
         copy_report(session.client("ssm"), nodes[0]["InstanceId"], directory, name, Path.home() / "project-reports")
@@ -361,9 +443,11 @@ def main(argv=None):
     parser.add_argument("--region", default="us-east-1")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start", help="Answer questions, review the estimate and approve deployment.")
-    setup = sub.add_parser("prepare", help="Prepare settings and the key on the EC2 controller.")
+    setup = sub.add_parser("prepare", help="Save settings without creating application resources.")
     setup.add_argument("--servers", type=int, choices=range(1, 21), metavar="1-20")
     sub.add_parser("estimate", help="Generate the live AWS cost forecast on the controller.")
+    remove = sub.add_parser("cleanup", help="Preview this environment's resources without deleting them.")
+    remove.add_argument("--execute", action="store_true", help="Ask for confirmation, then run cleanup.")
     pages = sub.add_parser("links", help="Upload HTML reports privately and print temporary browser links.")
     pages.add_argument("--minutes", type=int, choices=range(1, 61), default=60, metavar="1-60")
     files = sub.add_parser("download", help="Copy generated HTML reports into CloudShell for download.")
@@ -371,17 +455,20 @@ def main(argv=None):
     files.add_argument("--cost-only", action="store_true")
     args = parser.parse_args(argv)
     try:
+        migrate_local_files()
         if args.command == "estimate":
             return estimate()
         import boto3
         region = args.region
-        if args.command in ("prepare", "links", "start"):
+        if args.command in ("prepare", "links", "start", "cleanup"):
             path = BASE / "config/environment.json"
             selected = read_json(path if path.exists() else BASE / "config/environment.demo.json")
             region = selected["aws_region"]
         session = boto3.Session(region_name=region)
         if args.command == "start":
             return start(args, session)
+        if args.command == "cleanup":
+            return cleanup(args, session)
         if args.command == "prepare":
             prepare(args, session)
         elif args.command == "links":
@@ -395,7 +482,7 @@ def main(argv=None):
     except ImportError:
         print("Install boto3 first: python3 -m pip install --user boto3", file=sys.stderr)
     except Exception as error:
-        if isinstance(error, (RuntimeError, FileNotFoundError, json.JSONDecodeError)):
+        if isinstance(error, (RuntimeError, FileNotFoundError, ValueError)):
             message = str(error)
         elif isinstance(getattr(error, "response", None), dict):
             message = "AWS " + str(error.response.get("Error", {}).get("Code", "error"))

@@ -1,0 +1,90 @@
+---
+- name: Create the project network
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
+  tasks:
+    - name: Create the project VPC
+      amazon.aws.ec2_vpc_net:
+        name: "{{ project_resource_prefix }}-vpc"
+        region: "{{ settings.aws_region }}"
+        cidr_block: "{{ settings.vpc_cidr }}"
+        dns_support: true
+        dns_hostnames: true
+        tags: "{{ project_tags }}"
+        state: present
+      register: project_vpc
+
+    - name: Create the internet gateway
+      amazon.aws.ec2_vpc_igw:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        tags: "{{ project_tags }}"
+        state: present
+      register: project_igw
+
+    - name: Create the public application subnet
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        cidr: "{{ settings.public_subnet_cidr }}"
+        az: "{{ project_azs.availability_zones[0].zone_name }}"
+        map_public: true
+        tags: "{{ project_tags | combine({'Name': project_resource_prefix ~ '-public-a'}) }}"
+        state: present
+      register: project_public_subnet
+
+    - name: Create the first private database subnet
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        cidr: "{{ settings.private_subnet_a_cidr }}"
+        az: "{{ project_azs.availability_zones[0].zone_name }}"
+        map_public: false
+        tags: "{{ project_tags | combine({'Name': project_resource_prefix ~ '-private-a'}) }}"
+        state: present
+      register: project_private_a
+
+    - name: Create the second private database subnet
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        cidr: "{{ settings.private_subnet_b_cidr }}"
+        az: "{{ project_azs.availability_zones[1].zone_name }}"
+        map_public: false
+        tags: "{{ project_tags | combine({'Name': project_resource_prefix ~ '-private-b'}) }}"
+        state: present
+      register: project_private_b
+
+    - name: Route only the public subnet to the internet gateway
+      amazon.aws.ec2_vpc_route_table:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        subnets:
+          - "{{ project_public_subnet.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ project_igw.gateway_id }}"
+        tags: "{{ project_tags | combine({'Name': project_resource_prefix ~ '-public-routes'}) }}"
+      register: project_public_routes
+
+    - name: Keep both database subnets on local-only private routing
+      amazon.aws.ec2_vpc_route_table:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
+        subnets:
+          - "{{ project_private_a.subnet.id }}"
+          - "{{ project_private_b.subnet.id }}"
+        routes: []
+        purge_routes: true
+        tags: "{{ project_tags | combine({'Name': project_resource_prefix ~ '-private-routes'}) }}"
+      register: project_private_routes

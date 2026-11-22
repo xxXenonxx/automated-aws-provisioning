@@ -1,0 +1,81 @@
+---
+- name: Save the created resource addresses and settings
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
+  tasks:
+    - name: Require actual addresses before writing the deployment manifest
+      ansible.builtin.assert:
+        that:
+          - project_ec2.instances | length == deployment_instance_names | length
+          - project_ec2.instances | map(attribute='instance_id') | unique | list | length == deployment_instance_names | length
+          - project_ec2.instances | selectattr('public_ip_address', 'defined') | list | length == deployment_instance_names | length
+          - project_rds.endpoint.address is defined
+        fail_msg: AWS did not return the addresses required for application configuration.
+
+    - name: Create the controller-only state directory
+      ansible.builtin.file:
+        path: "{{ project_state_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Save actual nonsecret resource outputs
+      ansible.builtin.copy:
+        dest: "{{ project_state_dir }}/deployment.json"
+        mode: '0600'
+        content: >-
+          {{ {
+            'schema_version': 1,
+            'project_name': settings.project_name,
+            'environment_name': settings.environment_name,
+            'aws_region': settings.aws_region,
+            'account_id': project_identity.account,
+            'created_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+            'cost_estimate_sha256': deployment_cost_estimate_sha256,
+            'resources': {
+              'vpc_id': project_vpc.vpc.id,
+              'public_subnet_id': project_public_subnet.subnet.id,
+              'private_subnet_ids': [project_private_a.subnet.id, project_private_b.subnet.id],
+              'internet_gateway_id': project_igw.gateway_id,
+              'public_route_table_id': project_public_routes.route_table.id,
+              'private_route_table_id': project_private_routes.route_table.id,
+              'ec2_instance_ids': project_ec2.instances | map(attribute='instance_id') | list,
+              'web_security_group_id': project_web_sg.group_id,
+              'db_security_group_id': project_db_sg.group_id,
+              'rds_identifier': settings.rds_identifier,
+              'rds_endpoint': project_rds.endpoint.address,
+              'rds_port': project_rds.endpoint.port,
+              'rds_engine_version': project_rds.engine_version,
+              's3_bucket_name': settings.s3_bucket_name,
+              'website_urls': project_ec2.instances | map(attribute='public_ip_address') | map('regex_replace', '^', 'http://') | map('regex_replace', '$', '/') | list,
+              'website_url': 'http://' ~ project_ec2.instances[0].public_ip_address ~ '/'
+            },
+            'expected': {
+              'profile': 'complete_application',
+              'application_configured': false,
+              'ec2_count': deployment_instance_names | length,
+              'ec2_instance_type': settings.instance_type,
+              'ec2_ami_id': settings.ami_id,
+              'app_instance_profile_name': settings.app_instance_profile_name,
+              'db_multi_az': settings.db_multi_az,
+              'db_allowed_source_security_group_id': project_web_sg.group_id,
+              'vpc_cidr': settings.vpc_cidr,
+              'public_subnet_cidr': settings.public_subnet_cidr,
+              'private_subnet_a_cidr': settings.private_subnet_a_cidr,
+              'private_subnet_b_cidr': settings.private_subnet_b_cidr,
+              'ssh_source_cidr': settings.ssh_source_cidr,
+              'db_publicly_accessible': false,
+              's3_public_access_block': true,
+              's3_encryption': 'AES256',
+              's3_versioning': 'Enabled'
+            }
+          } | to_nice_json }}

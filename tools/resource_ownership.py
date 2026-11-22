@@ -233,6 +233,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--account", required=True)
+    parser.add_argument("--cleanup-plan", action="store_true")
     args = parser.parse_args(argv)
     try:
         from project_checks import load_json, validate_config
@@ -245,6 +246,10 @@ def main(argv=None):
         limits = Config(connect_timeout=5, read_timeout=15, retries={"mode": "standard", "max_attempts": 2})
         services = ("sts", "rds", "s3", "ec2") if config.get("profile") != "resource_provisioning" else ("sts", "rds", "s3")
         clients = {name: session.client(name, config=limits) for name in services}
+        if args.cleanup_plan:
+            import json
+            print(json.dumps(cleanup_plan(config, clients, args.account), sort_keys=True))
+            return 0
         check_existing_resources(config, clients, args.account)
     except OwnershipError as error:
         print(str(error), file=sys.stderr)
@@ -254,6 +259,81 @@ def main(argv=None):
         return 1
     print("Existing resource ownership and location checks passed. No AWS resources were changed.")
     return 0
+
+
+def cleanup_plan(config, clients, account):
+    """Discover the exact owned resources, including a partly completed run."""
+    check_existing_resources(config, clients, account)
+    ec2, rds, s3 = (clients[name] for name in ("ec2", "rds", "s3"))
+    prefix = config["project_name"] + "-" + config["environment_name"]
+    network = check_complete_network(config, ec2, account)
+    resources = {"vpc_id": network["vpc_id"], "ec2_instance_ids": [],
+                 "security_group_ids": [], "subnet_ids": [], "subnet_cidrs": {}, "route_table_ids": [],
+                 "internet_gateway_id": None, "rds_identifier": None,
+                 "db_subnet_group_name": None, "s3_bucket_name": None}
+    if network["vpc_id"]:
+        filters = [{"Name": "vpc-id", "Values": [network["vpc_id"]]}]
+        subnets = _items(ec2.describe_subnets(Filters=filters), "Subnets")
+        public_ids = {subnet["SubnetId"] for subnet in subnets
+                      if {t["Key"]: t["Value"] for t in subnet.get("Tags", [])}.get("Name") == prefix + "-public-a"}
+        response = ec2.describe_instances(Filters=filters)
+        if response.get("NextToken"):
+            raise OwnershipError("Too many instances for this cleanup preview. Review the VPC separately.")
+        for reservation in response["Reservations"]:
+            for instance in reservation["Instances"]:
+                if instance["State"]["Name"] == "terminated":
+                    continue
+                tags = _owned(instance, "Tags", config)
+                if (tags.get("Role") != "application" or tags.get("ManagedBy") != "Ansible"
+                        or instance["SubnetId"] not in public_ids
+                        or config.get("control_node_security_group_id") in [g["GroupId"] for g in instance["SecurityGroups"]]):
+                    raise OwnershipError("The project VPC contains a controller or an unrelated instance. Cleanup was refused.")
+                resources["ec2_instance_ids"].append(instance["InstanceId"])
+        for group in sorted(_items(ec2.describe_security_groups(Filters=filters), "SecurityGroups"), key=lambda g: g["GroupName"]):
+            if group["GroupName"] != "default":
+                resources["security_group_ids"].append(group["GroupId"])
+        resources["subnet_ids"] = [item["SubnetId"] for item in subnets]
+        resources["subnet_cidrs"] = {item["SubnetId"]: item["CidrBlock"] for item in subnets}
+        resources["route_table_ids"] = [item["RouteTableId"] for item in _items(ec2.describe_route_tables(Filters=filters), "RouteTables")
+                                         if not any(a.get("Main") for a in item.get("Associations", []))]
+    gateways = _items(ec2.describe_internet_gateways(Filters=[
+        {"Name": "tag:Project", "Values": [config["project_name"]]},
+        {"Name": "tag:Environment", "Values": [config["environment_name"]]}]), "InternetGateways")
+    if len(gateways) > 1:
+        raise OwnershipError("Several internet gateways match this environment. Review them before cleanup.")
+    for gateway in gateways:
+        _owned(gateway, "Tags", config)
+        if any(item.get("VpcId") != network["vpc_id"] for item in gateway.get("Attachments", [])):
+            raise OwnershipError("The matching internet gateway is attached to another VPC. Cleanup was refused.")
+        resources["internet_gateway_id"] = gateway["InternetGatewayId"]
+    try:
+        db = rds.describe_db_instances(DBInstanceIdentifier=config["rds_identifier"])["DBInstances"]
+    except Exception as error:
+        if not _missing(error, {"DBInstanceNotFound", "DBInstanceNotFoundFault"}):
+            raise
+        db = []
+    if db:
+        if db[0].get("DeletionProtection") or db[0]["DBInstanceStatus"] not in ("available", "stopped"):
+            raise OwnershipError("Wait until the database is available or stopped, and turn off its deletion protection before cleanup.")
+        resources["rds_identifier"] = config["rds_identifier"]
+    try:
+        groups = rds.describe_db_subnet_groups(DBSubnetGroupName=prefix + "-db-subnets")["DBSubnetGroups"]
+        resources["db_subnet_group_name"] = prefix + "-db-subnets" if groups else None
+    except Exception as error:
+        if not _missing(error, {"DBSubnetGroupNotFound", "DBSubnetGroupNotFoundFault"}):
+            raise
+    try:
+        s3.get_bucket_tagging(Bucket=config["s3_bucket_name"], ExpectedBucketOwner=account)
+        resources["s3_bucket_name"] = config["s3_bucket_name"]
+    except Exception as error:
+        if not _missing(error, {"NoSuchBucket", "404", "NotFound"}):
+            raise
+    for name, value in resources.items():
+        if isinstance(value, list) and name != "security_group_ids":
+            resources[name] = sorted(value)
+    return {"account_id": account, "aws_region": config["aws_region"],
+            "project_name": config["project_name"], "environment_name": config["environment_name"],
+            "resources": resources}
 
 
 if __name__ == "__main__":

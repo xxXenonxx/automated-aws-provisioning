@@ -55,7 +55,7 @@ if ! flock -n 9; then
     exit 1
 fi
 for required in config/environment.json config/cost-assumptions.json \
-    tools/project_checks.py tools/cost_estimate.py deploy.yml; do
+    tools/project_checks.py tools/cost_estimate.py site.yml; do
     if [[ ! -f "$required" || ! -r "$required" ]]; then
         printf 'Missing readable project input: %s\n' "$required" >&2
         exit 1
@@ -123,7 +123,7 @@ unset approved_demo_confirmation
 # A shell environment assignment reaches only this Ansible child. The password
 # is not an argument, an extra variable, a printed message or a stored file.
 RDS_MASTER_PASSWORD="$approved_demo_password" \
-    "$PLAYBOOK" -i localhost, deploy.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
+    "$PLAYBOOK" -i inventory/inventory.ini site.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
 
 unset approved_demo_password
 if ! "$PYTHON" tools/demo.py links; then

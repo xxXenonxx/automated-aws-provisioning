@@ -1,41 +1,68 @@
-
 ---
-- name: Provision a basic EC2 instance
+- name: Create the selected application servers
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-    ami_id: "ami-0fa5967347d08d2df"
-    vpc_id: "vpc-0d347abaa076d4f22"
-    subnet_id: "subnet-0d150abb3ea59c23d"
-    security_group_name: "ansible-project-test"
-    instance_name: "ansible-project-ec2"
-    instance_type: "t3.micro"
-    key_pair_name: "automated-aws-project-key"
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
   tasks:
-    - name: Launch an EC2 instance
+    - name: Find only this environment tagged application servers
+      amazon.aws.ec2_instance_info:
+        region: "{{ settings.aws_region }}"
+        filters:
+          "tag:Project": "{{ settings.project_name }}"
+          "tag:Environment": "{{ settings.environment_name }}"
+          "tag:Role": application
+          instance-state-name: [pending, running, stopping, stopped]
+      register: existing_app_instances
+
+    - name: Keep all retained application servers inside the reviewed request
+      ansible.builtin.assert:
+        that:
+          - existing_app_instances.instances | map(attribute='tags.Name') | difference(deployment_instance_names) | length == 0
+          - existing_app_instances.instances | map(attribute='tags.Name') | unique | list | length == existing_app_instances.instances | length
+        fail_msg: Existing application servers do not match the reviewed names. Review duplicates or retained servers before provisioning; no server is deleted automatically.
+
+    - name: Launch or reuse each selected application server
       amazon.aws.ec2_instance:
-        name: "{{ instance_name }}"
-        region: "{{ aws_region }}"
-        image_id: "{{ ami_id }}"
-        instance_type: "{{ instance_type }}"
-        key_name: "{{ key_pair_name }}"
-        vpc_subnet_id: "{{ subnet_id }}"
+        name: "{{ item }}"
+        region: "{{ settings.aws_region }}"
+        key_name: "{{ settings.ec2_key_name }}"
+        vpc_subnet_id: "{{ project_public_subnet.subnet.id }}"
+        instance_type: "{{ settings.instance_type }}"
+        image_id: "{{ settings.ami_id }}"
+        iam_instance_profile: "{{ settings.app_instance_profile_name }}"
         network:
           assign_public_ip: true
         security_groups:
-          - "{{ security_group_name }}"
-        state: running
+          - "{{ project_web_sg.group_id }}"
+        metadata_options:
+          http_endpoint: enabled
+          http_tokens: required
+        tags: "{{ project_tags | combine({'Role': 'application'}) }}"
+        filters:
+          "tag:Name": "{{ item }}"
+          "tag:Project": "{{ settings.project_name }}"
+          "tag:Environment": "{{ settings.environment_name }}"
+          "tag:Role": application
+          instance-state-name: [pending, running, stopping, stopped]
+        volumes: "{{ deployment_root_volume_mapping }}"
+        cpu_credit_specification: "{{ 'standard' if settings.instance_type is match('^t[0-9]') else omit }}"
         wait: true
-      register: ec2_result
+        state: running
+      loop: "{{ deployment_instance_names }}"
+      loop_control:
+        label: "{{ item }}"
+      register: project_ec2_servers
 
-    - name: Display EC2 instance details
-      ansible.builtin.debug:
-        msg:
-          - "Instance ID: {{ ec2_result.instances[0].instance_id }}"
-          - "Instance state: {{ ec2_result.instances[0].state.name }}"
-          - "Instance type: {{ ec2_result.instances[0].instance_type }}"
-          - "AMI ID: {{ ec2_result.instances[0].image_id }}"
+    - name: Collect the exact selected application server results
+      ansible.builtin.set_fact:
+        project_ec2:
+          instances: "{{ project_ec2_servers.results | map(attribute='instances') | flatten }}"

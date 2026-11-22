@@ -1,29 +1,12 @@
 # Automated AWS Provisioning with Ansible
 
-The project creates an application network, one or more EC2 application servers, a private MySQL database and a private S3 bucket. Ansible installs the Apache/PHP example application on each server. The workflow checks the request, estimates its monthly cost, asks for approval, deploys and generates HTML reports.
+Choose a server count, sizes and database options in the terminal. The project estimates the cost, asks for approval, creates an AWS environment, installs a media gallery and checks the result.
 
-## Files to use
+## Start
 
-| File | Purpose |
-| --- | --- |
-| `deployment/bootstrap/install.sh` | Install Python, Ansible and the AWS collection on the controller. |
-| `deployment/config/environment.demo.json` | Starting settings for the two-server demonstration. |
-| `deployment/config/environment.json` | Your prepared settings; generated locally and excluded from Git. |
-| `deployment/config/cost-assumptions.json` | Expected usage for the estimate; generated locally and excluded from Git. |
-| `deployment/tools/demo.py` | Short commands to Prompt for settings, estimate cost and view/download reports. |
-| `deployment/deploy.sh` | Ask for approval/password and run the deployment. |
-| `deployment/deploy.yml` | Ansible workflow: checks, cost, network/resources, software and final checks. |
-| `Complete project/playbooks/provision.yml` | Create the network and resources. |
-| `Complete project/playbooks/configure.yml` | Install the application. |
-| `Complete project/playbooks/cleanup.yml` | Cleanup using the saved deployment resource IDs. |
+Use an Amazon Linux 2023 x86 EC2 controller with the `ProjectControlRole` instance profile, a public IPv4 address and internet access. Its security group needs outbound access; Session Manager does not require an inbound SSH rule. Application servers use `ProjectAppRole`, with access to the selected private S3 bucket. Create these roles before deployment.
 
-The remaining Python files in `deployment/tools` implement pricing, checks, resource ownership and reporting. Users do not run each file separately. The root `site.yml` and `playbooks/` contain the earlier resource-only workflow. Use `deployment/tools/demo.py start` for the complete application workflow.
-
-## Controller setup
-
-Launch one Amazon Linux 2023 x86 EC2 controller with a public IPv4 address and the `ProjectControlRole` instance profile. For the supplied demo use `t3.micro`, an 8 GiB gp3 disk and one dedicated security group with outbound access. Connect through Session Manager. The application servers use the separate `ProjectAppRole` instance profile, scoped to the chosen bucket. Both roles must already exist.
-
-Run the user switch separately, then continue as `ec2-user`:
+In the controller's Session Manager terminal, run each box separately:
 
 ```bash
 sudo -iu ec2-user
@@ -34,68 +17,93 @@ sudo dnf install -y git
 ```
 
 ```bash
-git clone -b ahmed/checked-aws-provisioning \
-  https://github.com/xxXenonxx/automated-aws-provisioning.git ~/aws-project-video
+git clone -b ahmed/checked-aws-provisioning https://github.com/xxXenonxx/automated-aws-provisioning.git ~/aws-project-video
 ```
 
 ```bash
-sudo bash ~/aws-project-video/deployment/bootstrap/install.sh
+sudo bash ~/aws-project-video/bootstrap/install.sh
 ```
 
 ```bash
-cd ~/aws-project-video/deployment
+cd ~/aws-project-video
 source /opt/aws-project-venv/bin/activate
 ```
-
-## Configure and deploy
 
 ```bash
 python tools/demo.py start
 ```
 
-Answer the questions for server count/size, disk size and the MySQL database. Press Enter to keep the displayed value. Usage and advanced settings are optional. The command detects the controller details, shows a request summary and saves the settings after confirmation. It then calculates the cost and asks for an accepted USD estimate limit and the database password before deployment. Type `cancel` at the approval prompt to stop before creating application resources.
+Answer the questions and review the summary. Press Enter to keep a displayed value. After the forecast appears, enter the monthly estimate you accept, or `cancel`. Enter the database password twice when asked; it stays hidden. Use the existing password when running against an existing database.
 
-If a saved deployment exists, the opening menu offers reports, reviewing the settings/running again, or exit. Opening reports is the default. Existing infrastructure names are retained when reviewing a deployed environment. Capacity reductions, network replacements and database migrations are not performed automatically.
+The accepted amount checks the deployment forecast. It does not cap the later AWS bill or stop resources automatically.
 
-The application currently supports the Apache/PHP example with private MySQL and S3. Region follows the controller. Other names, sizes and images must be allowed by the controller IAM role. The prompts write `config/environment.json` and `config/cost-assumptions.json`; no manual file editing is required. Local settings and private keys stay outside Git.
+## What runs
 
-For separate stages, the existing commands remain available:
+`tools/demo.py start` asks questions and saves the answers. `deploy.sh` collects approval and the password, then runs **`site.yml`**. This is the single Ansible deployment entry point.
 
-```bash
-python tools/demo.py prepare --servers 2
-python tools/demo.py estimate
-```
+| Stage | Files actually used |
+| --- | --- |
+| Prepare the SSH key | `playbooks/key_pair.yml` |
+| Check the request and calculate AWS prices | `playbooks/preflight.yml`, `playbooks/estimate_cost.yml` |
+| Create the VPC, public/private subnets and routes | `playbooks/network.yml` |
+| Create server access rules, storage, servers and MySQL | `playbooks/security_groups.yml`, `s3.yml`, `ec2.yml`, `rds.yml` |
+| Save the actual resource IDs and addresses | `playbooks/outputs.yml` |
+| Install Apache, PHP and the gallery on every server | `playbooks/configure.yml` |
+| Compare the created setup with the request and generate the report | `playbooks/verify.yml` |
+| Remove a reviewed environment | `playbooks/cleanup.yml` |
 
-```bash
-bash deploy.sh
-```
+The controller calls AWS APIs through the `amazon.aws` Ansible collection. It uses SSH to configure the application servers. `inventory/inventory.ini` contains the controller; the application inventory is filled from the actual created instance IDs and addresses.
 
-The accepted amount checks the deployment forecast, not the later AWS bill. On a rerun use the database's existing password.
+The gallery stores image files in S3 and their titles, descriptions and file references in MySQL. All application servers use the same database and bucket. Uploading through one server can therefore be viewed through another. Multiple servers demonstrate the requested initial capacity; load balancing, automatic scaling and application failover are not implemented.
+
+## Settings
+
+The questions create `config/environment.json` and `config/cost-assumptions.json` locally. You can also edit them before starting. Neither file, the SSH private key, nor generated reports are committed.
+
+Basic questions cover server count/size, disk size, database size/storage and Multi-AZ. Optional questions cover usage estimates, resource names, the supported Amazon Linux image, network CIDRs, key settings and the application instance profile. Region follows the controller. Permissions must allow the selected resources. The installed application currently supports Apache/PHP with MySQL and S3.
+
+For an existing deployment, opening reports is the default menu choice. Running again retains its infrastructure names. The program does not automatically shrink capacity, replace networks or migrate databases.
+
+`config/environment.demo.json` contains starting values, not a fixed deployment. `tools/` contains the pricing, validation and reporting functions used by the workflow; users do not run every helper separately.
 
 ## Reports
 
-After a successful deployment, the terminal prints browser links and the saved S3 report location. The HTML files remain stored under `reports/` in the private project bucket until deleted. The printed AWS-console location can be bookmarked; sign in to view or download the saved files there. Public access stays blocked. Anyone holding a link can view that report for up to one hour, or until the signing credentials expire. Keep the links private.
+After deployment, the terminal prints the application addresses and report links. The reports are saved locally in `reports/` and privately in the project's S3 bucket. Bookmark the printed AWS-console location. Quick-open links expire after up to one hour; the saved files remain until deleted.
 
-To refresh the links on the controller:
+Refresh the links on the controller:
 
 ```bash
 python tools/demo.py links
 ```
 
-The controller role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::YOUR_BUCKET/reports/*`. The application's image permissions do not need to change. Links are created after the bucket and reports exist; use the terminal estimate or download command before deployment.
-
-### Download a local copy
-
-The deployment writes `reports/cost-estimate.html` and `reports/report.html` on the controller. To download them through CloudShell, clone the same branch there and run:
+The controller needs `s3:PutObject` and `s3:GetObject` on the chosen bucket's `reports/*`. To download reports through CloudShell, clone this branch there and run:
 
 ```bash
-python3 ~/aws-project-video/deployment/tools/demo.py download
+python3 ~/aws-project-video/tools/demo.py download
 ```
 
-For the estimate before deployment use `download --cost-only`. If more than one controller matches, add `--controller INSTANCE_ID`. If boto3 is unavailable in CloudShell, install it with `python3 -m pip install --user boto3`.
+Then choose **Actions > Download file**, using the saved path printed by the command. Add `--cost-only` for the estimate before deployment. CloudShell needs boto3 and permission to read the controller through Systems Manager.
 
-In CloudShell choose **Actions > Download file** and enter `/home/cloudshell-user/project-reports/cost-estimate.html` or `/home/cloudshell-user/project-reports/report.html`. The copy command only reads the generated HTML reports; it does not create a public report site.
+The final report checks selected resource settings and website responses. Full photo upload/edit/delete is demonstrated manually; it is not claimed as an automatic verification check.
 
 ## Cleanup
 
-Keep the controller and its local `deployment/state/deployment.json` until the reports are downloaded and cleanup is reviewed. The complete cleanup playbook checks the exact saved resource IDs and asks for explicit confirmation. Database snapshot handling must be selected before deletion. No cleanup is performed by preparation, estimation or report download.
+Download any reports or images you need first. Preview only:
+
+```bash
+python tools/demo.py cleanup
+```
+
+To delete the displayed environment:
+
+```bash
+python tools/demo.py cleanup --execute
+```
+
+Choose whether to keep a final database snapshot, approve deletion of every S3 file/version and type the environment name. Cancelling these questions deletes nothing. Ansible refreshes the resource list and refuses if it changed after the preview. Discovery also supports a partially completed deployment or cleanup.
+
+Cleanup removes the application servers, database, bucket and application network. It keeps the controller, IAM roles, SSH key and local reports. A retained database snapshot and the controller can continue to incur charges. The controller role must allow deletion of the selected project resources. AWS dependency errors stop cleanup; review the error and rerun the preview before retrying.
+
+## Updating an older checkout
+
+Run `git pull --ff-only` from `~/aws-project-video`, activate the virtual environment and use the same start command. Existing ignored settings, state and reports from the former `deployment/` folder are copied automatically to the root layout. The old folder is retained as `.previous-layout/`. Conflicting files stop the update instead of overwriting a deployment record. Updating the code does not redeploy or delete AWS resources.

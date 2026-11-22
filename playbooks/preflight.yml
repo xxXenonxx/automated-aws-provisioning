@@ -1,30 +1,4 @@
 ---
-- name: Select the settings for these preflight checks
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tasks:
-    - name: Locate the settings file
-      ansible.builtin.set_fact:
-        deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
-
-    - name: Read the selected setup without changing AWS
-      ansible.builtin.include_vars:
-        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
-        name: preflight_settings
-
-    - name: Keep selection consistent with the checked workflow
-      ansible.builtin.assert:
-        that:
-          - deployment_settings is not defined or deployment_settings == preflight_settings
-          - preflight_settings.profile | default('complete_application') == 'complete_application'
-        fail_msg: Use unchanged complete_application settings.
-
-    - name: Keep the selected profile for the following checks
-      ansible.builtin.set_fact:
-        deployment_settings: "{{ preflight_settings }}"
-        deployment_workflow: "{{ preflight_settings.profile | default('complete_application') }}"
-
 - name: Validate before creating any AWS resources
   hosts: localhost
   connection: local
@@ -32,6 +6,10 @@
   vars:
     ansible_python_interpreter: "{{ ansible_playbook_python }}"
   tasks:
+    - name: Locate the shared deployment workflow
+      ansible.builtin.set_fact:
+        deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
+
     - name: Validate JSON settings without calling AWS
       ansible.builtin.command:
         argv:
@@ -41,10 +19,6 @@
           - --config
           - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
       changed_when: false
-
-    - name: Locate the shared deployment workflow
-      ansible.builtin.set_fact:
-        deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
 
     - name: Read the selected nonsecret environment settings
       ansible.builtin.include_vars:
@@ -133,10 +107,6 @@
       amazon.aws.aws_caller_info:
         region: "{{ settings.aws_region }}"
       register: project_identity
-
-    - name: Reuse the same checked account in the shared workflow
-      ansible.builtin.set_fact:
-        deployment_identity: "{{ project_identity }}"
 
     - name: Check existing project resource ownership before any creation
       ansible.builtin.command:
