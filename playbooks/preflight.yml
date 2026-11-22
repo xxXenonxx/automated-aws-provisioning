@@ -80,15 +80,18 @@
       ansible.builtin.set_fact:
         deployment_instance_names: "{{ (selected_server_plan.stdout | from_json).server_names }}"
 
-    - name: Require a database password supplied through the controller environment
+    - name: Require a valid database password from Ansible Vault
       ansible.builtin.assert:
         that:
-          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length >= 8
-          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length <= 41
-          - "'/' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-          - "'\"' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-          - "'@' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-        fail_msg: Set RDS_MASTER_PASSWORD to 8-41 characters without /, double quote or @.
+          - project_secret_project | default('') == settings.project_name
+          - project_secret_environment | default('') == settings.environment_name
+          - project_secret_database | default('') == settings.rds_identifier
+          - project_database_password | length >= 8
+          - project_database_password | length <= 41
+          - "'/' not in project_database_password"
+          - "'\"' not in project_database_password"
+          - "'@' not in project_database_password"
+        fail_msg: Create config/secrets.yml with the Vault command; use 8-41 characters without /, double quote or @.
       no_log: true
 
     - name: Check the controller has the corresponding SSH private key

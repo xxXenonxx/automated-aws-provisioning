@@ -2,6 +2,7 @@
 """Prepare a deployment, estimate its cost and open or download its reports."""
 import argparse
 import base64
+import getpass
 import hashlib
 import json
 import os
@@ -267,6 +268,47 @@ def estimate():
     return subprocess.call([str(playbook), "-i", "inventory/inventory.ini", "playbooks/estimate_cost.yml"], cwd=BASE)
 
 
+def vault():
+    """Encrypt the database secret through the standard Ansible Vault CLI."""
+    if not sys.stdin.isatty():
+        raise RuntimeError("Create the secret in the controller's interactive terminal.")
+    target = BASE / "config/secrets.yml"
+    if target.exists():
+        if not target.read_bytes().startswith(b"$ANSIBLE_VAULT;"):
+            raise RuntimeError("config/secrets.yml must be encrypted with Ansible Vault before deployment.")
+        print("Encrypted secrets already exist. Deployment will ask for the Vault password.")
+        return 0
+    settings = read_json(BASE / "config/environment.json")
+    secret = getpass.getpass("Database password: ")
+    repeated = getpass.getpass("Repeat database password: ")
+    if secret != repeated or not 8 <= len(secret) <= 41 or any(c in secret for c in '/"@'):
+        raise RuntimeError("Use matching passwords of 8-41 characters without slash, double quote or @.")
+    executable = Path("/opt/aws-project-venv/bin/ansible-vault")
+    if not executable.is_file():
+        raise RuntimeError("Install the controller tools before creating the Vault file.")
+    values = {"project_database_password": secret, "project_secret_project": settings["project_name"],
+              "project_secret_environment": settings["environment_name"],
+              "project_secret_database": settings["rds_identifier"]}
+    print("Choose a separate Vault password to encrypt this secret. Remember it; it is not saved.")
+    temporary = target.with_suffix(".tmp")
+    try:
+        result = subprocess.run([str(executable), "encrypt", "--vault-id", "project@prompt",
+                                 "--output", str(temporary), "-"],
+                                input=json.dumps(values).encode("utf-8"), stdout=subprocess.PIPE, cwd=BASE)
+        if result.returncode != 0:
+            raise RuntimeError("Vault encryption did not finish. Deployment was not started.")
+        if not temporary.read_bytes().startswith(b"$ANSIBLE_VAULT;"):
+            raise RuntimeError("Vault did not return an encrypted file. Nothing was saved.")
+        temporary.chmod(0o600)
+        if target.exists():
+            raise RuntimeError("A secrets file appeared during encryption. Review it before continuing.")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print("Encrypted database settings saved in config/secrets.yml.")
+    return 0
+
+
 def cleanup(args, session):
     from resource_ownership import cleanup_plan
     from project_checks import validate_config
@@ -446,6 +488,7 @@ def main(argv=None):
     setup = sub.add_parser("prepare", help="Save settings without creating application resources.")
     setup.add_argument("--servers", type=int, choices=range(1, 21), metavar="1-20")
     sub.add_parser("estimate", help="Generate the live AWS cost forecast on the controller.")
+    sub.add_parser("vault", help="Create the encrypted database settings through Ansible Vault.")
     remove = sub.add_parser("cleanup", help="Preview this environment's resources without deleting them.")
     remove.add_argument("--execute", action="store_true", help="Ask for confirmation, then run cleanup.")
     pages = sub.add_parser("links", help="Upload HTML reports privately and print temporary browser links.")
@@ -458,6 +501,8 @@ def main(argv=None):
         migrate_local_files()
         if args.command == "estimate":
             return estimate()
+        if args.command == "vault":
+            return vault()
         import boto3
         region = args.region
         if args.command in ("prepare", "links", "start", "cleanup"):

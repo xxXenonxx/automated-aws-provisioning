@@ -36,12 +36,12 @@
     - name: Require the database secret before changing application configuration
       ansible.builtin.assert:
         that:
-          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length >= 8
-          - lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') | length <= 41
-          - "'/' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-          - "'\"' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-          - "'@' not in lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD')"
-        fail_msg: Set RDS_MASTER_PASSWORD on the controller before configuring the application.
+          - project_database_password | length >= 8
+          - project_database_password | length <= 41
+          - "'/' not in project_database_password"
+          - "'\"' not in project_database_password"
+          - "'@' not in project_database_password"
+        fail_msg: Run the deployment with the encrypted database settings and its Vault password.
       no_log: true
 
     - name: Read the actual deployment outputs
@@ -166,7 +166,7 @@
             'db_port': deployment_outputs.resources.rds_port,
             'db_name': deployment_settings.db_name,
             'db_user': deployment_settings.db_username,
-            'db_password': lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD'),
+            'db_password': project_database_password,
             'region': deployment_outputs.aws_region
           } | to_nice_json }}
       no_log: true

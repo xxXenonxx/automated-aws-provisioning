@@ -51,7 +51,7 @@
         storage_type: gp3
         storage_encrypted: true
         master_username: "{{ settings.db_username }}"
-        master_user_password: "{{ lookup('ansible.builtin.env', 'RDS_MASTER_PASSWORD') }}"
+        master_user_password: "{{ project_database_password }}"
         db_subnet_group_name: "{{ project_resource_prefix }}-db-subnets"
         vpc_security_group_ids:
           - "{{ project_db_sg.group_id }}"
