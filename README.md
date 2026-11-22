@@ -60,7 +60,7 @@ The gallery stores image files in S3 and their titles, descriptions and file ref
 
 The questions create `config/environment.json` and `config/cost-assumptions.json` locally. Ansible Vault encrypts the database secret in `config/secrets.yml`; the encrypted file is also excluded from Git. Its Vault password is not saved by the project. You can also edit them before starting. The local settings, encrypted secrets, SSH private key and generated reports are not committed.
 
-Basic questions cover server count/size, disk size, database size/storage and Multi-AZ. Optional questions cover usage estimates, resource names, the supported Amazon Linux image, network CIDRs, key settings and the application instance profile. Region follows the controller. Permissions must allow the selected resources. The installed application currently supports Apache/PHP with MySQL and S3.
+Basic questions cover server count/size, disk size, database size/storage and Multi-AZ. Optional questions cover usage estimates, resource names, the supported Amazon Linux image, network CIDRs, key settings and the application instance profile. The supplied settings use us-east-1. For another region, set the controller and deployment to that region and select a matching AMI and IAM permissions. Permissions must allow the selected resources. The installed application currently supports Apache/PHP with MySQL and S3.
 
 For an existing deployment, opening reports is the default menu choice. Running again retains its infrastructure names. The program does not automatically shrink capacity, replace networks or migrate databases.
 
