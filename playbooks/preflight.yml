@@ -83,9 +83,6 @@
     - name: Require a valid database password from Ansible Vault
       ansible.builtin.assert:
         that:
-          - project_secret_project | default('') == settings.project_name
-          - project_secret_environment | default('') == settings.environment_name
-          - project_secret_database | default('') == settings.rds_identifier
           - project_database_password | length >= 8
           - project_database_password | length <= 41
           - "'/' not in project_database_password"

@@ -268,15 +268,19 @@ def estimate():
     return subprocess.call([str(playbook), "-i", "inventory/inventory.ini", "playbooks/estimate_cost.yml"], cwd=BASE)
 
 
-def vault():
+def vault(replace=False):
     """Encrypt the database secret through the standard Ansible Vault CLI."""
     if not sys.stdin.isatty():
         raise RuntimeError("Create the secret in the controller's interactive terminal.")
     target = BASE / "config/secrets.yml"
-    if target.exists():
+    original = target.read_bytes() if target.exists() else None
+    if original is not None and not replace:
         if not target.read_bytes().startswith(b"$ANSIBLE_VAULT;"):
             raise RuntimeError("config/secrets.yml must be encrypted with Ansible Vault before deployment.")
         print("Encrypted secrets already exist. Deployment will ask for the Vault password.")
+        return 0
+    if original is not None and not yes_no("Replace the saved database secret for the selected settings", False):
+        print("Cancelled. The existing Vault file was kept.")
         return 0
     settings = read_json(BASE / "config/environment.json")
     secret = getpass.getpass("Database password: ")
@@ -300,8 +304,9 @@ def vault():
         if not temporary.read_bytes().startswith(b"$ANSIBLE_VAULT;"):
             raise RuntimeError("Vault did not return an encrypted file. Nothing was saved.")
         temporary.chmod(0o600)
-        if target.exists():
-            raise RuntimeError("A secrets file appeared during encryption. Review it before continuing.")
+        current = target.read_bytes() if target.exists() else None
+        if current != original:
+            raise RuntimeError("The secrets file changed during encryption. It was not replaced.")
         temporary.replace(target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -488,7 +493,8 @@ def main(argv=None):
     setup = sub.add_parser("prepare", help="Save settings without creating application resources.")
     setup.add_argument("--servers", type=int, choices=range(1, 21), metavar="1-20")
     sub.add_parser("estimate", help="Generate the live AWS cost forecast on the controller.")
-    sub.add_parser("vault", help="Create the encrypted database settings through Ansible Vault.")
+    secret_setup = sub.add_parser("vault", help="Create the encrypted database settings through Ansible Vault.")
+    secret_setup.add_argument("--replace", action="store_true", help="Confirm before replacing an existing Vault file.")
     remove = sub.add_parser("cleanup", help="Preview this environment's resources without deleting them.")
     remove.add_argument("--execute", action="store_true", help="Ask for confirmation, then run cleanup.")
     pages = sub.add_parser("links", help="Upload HTML reports privately and print temporary browser links.")
@@ -502,7 +508,7 @@ def main(argv=None):
         if args.command == "estimate":
             return estimate()
         if args.command == "vault":
-            return vault()
+            return vault(args.replace)
         import boto3
         region = args.region
         if args.command in ("prepare", "links", "start", "cleanup"):

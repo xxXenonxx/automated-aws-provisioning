@@ -76,6 +76,8 @@ python tools/demo.py vault
 
 The CLI passes the hidden database value to `ansible-vault encrypt` through standard input. Plaintext secrets are not written to a controller settings file. Keep the Vault password separately; forgetting it requires recovering or recreating the secret. After unlocking it, Ansible supplies the value to RDS and the application's protected configuration file. Vault protects stored secrets, not an application while it is running.
 
+After choosing a different database or environment, use `python tools/demo.py vault --replace` to confirm and create matching encrypted settings. Creating or replacing the file does not change AWS resources; deployment still requires approval.
+
 Ansible can also configure on-premises servers over SSH or WinRM. That is a capability of Ansible; this project's resource-creation playbooks currently target AWS.
 
 ## Reports

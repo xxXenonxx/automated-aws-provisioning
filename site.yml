@@ -21,6 +21,14 @@
           - deployment_settings.profile | default('complete_application') == 'complete_application'
         fail_msg: Use complete_application for the project network and application.
 
+    - name: Match the encrypted database settings to this environment
+      ansible.builtin.assert:
+        that:
+          - project_secret_project | default('') == deployment_settings.project_name
+          - project_secret_environment | default('') == deployment_settings.environment_name
+          - project_secret_database | default('') == deployment_settings.rds_identifier
+        fail_msg: The Vault file does not match this request. Review the settings, then run python tools/demo.py vault --replace. No application resources have been created.
+
 - name: Prepare the application SSH key
   ansible.builtin.import_playbook: playbooks/key_pair.yml
 
