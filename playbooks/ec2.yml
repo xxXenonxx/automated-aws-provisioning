@@ -39,8 +39,8 @@
         instance_type: "{{ settings.instance_type }}"
         image_id: "{{ settings.ami_id }}"
         iam_instance_profile: "{{ settings.app_instance_profile_name }}"
-        network:
-          assign_public_ip: true
+        network_interfaces:
+          - assign_public_ip: true
         security_groups:
           - "{{ project_web_sg.group_id }}"
         metadata_options:
