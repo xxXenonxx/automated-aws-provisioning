@@ -1,116 +1,160 @@
 ---
-- name: Clean up all project AWS resources
+- name: Remove the reviewed application environment
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-
-    ec2_instance_name: ansible-project-ec2
-    security_group_name: ansible-project-test
-    key_pair_name: automated-aws-project-key
-    s3_bucket_filter: automated-aws-provisioning-813334298384-us-east-1-
-
-    db_identifier: automated-aws-project-db
-    db_subnet_group_name: automated-aws-project-db-subnets
-    db_security_group_name: automated-aws-project-db-sg
-    vpc_id: "vpc-0d347abaa076d4f22"
-
+    deployment_repo_dir: "{{ playbook_dir | regex_replace('/playbooks$', '') }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
   tasks:
-    - name: Find manual snapshots belonging to the project database
-      amazon.aws.rds_snapshot_info:
-        region: "{{ aws_region }}"
-        db_instance_identifier: "{{ db_identifier }}"
-        snapshot_type: manual
-      register: project_db_snapshots
+    - name: Require a confirmed cleanup plan
+      ansible.builtin.assert:
+        that:
+          - confirm_cleanup | default(false) | bool
+          - delete_bucket_contents | default(false) | bool
+          - approved_cleanup_plan is defined
+          - discard_database_snapshot is defined
+          - cleanup_snapshot_name is defined
+        fail_msg: Run python tools/demo.py cleanup --execute and review its questions before deleting resources.
 
-    - name: Delete manual snapshots belonging to the project database
-      amazon.aws.rds_instance_snapshot:
-        region: "{{ aws_region }}"
-        instance_id: "{{ db_identifier }}"
-        snapshot_id: "{{ item.db_snapshot_identifier }}"
-        state: absent
-        wait: true
-      loop: "{{ project_db_snapshots.snapshots | default([]) }}"
-      loop_control:
-        label: "{{ item.db_snapshot_identifier }}"
+    - name: Read the selected environment
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+        name: settings
 
-    - name: Delete the project RDS database without creating a final snapshot
-      amazon.aws.rds_instance:
-        region: "{{ aws_region }}"
-        db_instance_identifier: "{{ db_identifier }}"
-        state: absent
-        skip_final_snapshot: true
-        wait: true
+    - name: Confirm the active AWS account
+      amazon.aws.aws_caller_info:
+        region: "{{ settings.aws_region }}"
+      register: cleanup_identity
 
-    - name: Delete the project RDS DB subnet group
-      amazon.aws.rds_subnet_group:
-        region: "{{ aws_region }}"
-        name: "{{ db_subnet_group_name }}"
-        state: absent
+    - name: Refresh the owned resource list before any deletion
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/resource_ownership.py"
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+          - --account
+          - "{{ cleanup_identity.account }}"
+          - --cleanup-plan
+      register: fresh_cleanup
+      changed_when: false
 
-    - name: Delete the project RDS security group
-      amazon.aws.ec2_security_group:
-        region: "{{ aws_region }}"
-        name: "{{ db_security_group_name }}"
-        vpc_id: "{{ vpc_id }}"
-        state: absent
+    - name: Stop if the reviewed targets changed
+      ansible.builtin.assert:
+        that:
+          - fresh_cleanup.stdout | from_json == approved_cleanup_plan
+        fail_msg: The environment changed after the preview. Nothing was deleted; review a new cleanup preview.
 
-    - name: Find project EC2 instances
-      amazon.aws.ec2_instance_info:
-        region: "{{ aws_region }}"
-        filters:
-          "tag:Name": "{{ ec2_instance_name }}"
-          instance-state-name:
-            - pending
-            - running
-            - stopping
-            - stopped
-      register: project_instances
+    - name: Use only the reviewed resource identifiers
+      ansible.builtin.set_fact:
+        cleanup_resources: "{{ approved_cleanup_plan.resources }}"
 
-    - name: Terminate project EC2 instances
+    - name: Terminate only the application servers
       amazon.aws.ec2_instance:
-        region: "{{ aws_region }}"
-        instance_ids: "{{ project_instances.instances | map(attribute='instance_id') | list }}"
+        region: "{{ settings.aws_region }}"
+        instance_ids: "{{ cleanup_resources.ec2_instance_ids }}"
         state: absent
         wait: true
-      when: project_instances.instances | length > 0
+      when: cleanup_resources.ec2_instance_ids | length > 0
 
-    - name: Find project S3 buckets
-      amazon.aws.s3_bucket_info:
-        region: "{{ aws_region }}"
-        name_filter: "{{ s3_bucket_filter }}"
-      register: project_buckets
+    - name: Delete the database with the selected snapshot choice
+      amazon.aws.rds_instance:
+        region: "{{ settings.aws_region }}"
+        db_instance_identifier: "{{ cleanup_resources.rds_identifier }}"
+        state: absent
+        skip_final_snapshot: "{{ discard_database_snapshot | bool }}"
+        final_db_snapshot_identifier: "{{ omit if discard_database_snapshot | bool else cleanup_snapshot_name }}"
+        wait: true
+      when: cleanup_resources.rds_identifier is not none
 
-    - name: Delete project S3 buckets and all their object versions
+    - name: Delete the database subnet group
+      amazon.aws.rds_subnet_group:
+        region: "{{ settings.aws_region }}"
+        name: "{{ cleanup_resources.db_subnet_group_name }}"
+        state: absent
+      when: cleanup_resources.db_subnet_group_name is not none
+
+    - name: Delete all approved bucket versions and the bucket
       amazon.aws.s3_bucket:
-        name: "{{ item.name }}"
-        region: "{{ aws_region }}"
+        region: "{{ settings.aws_region }}"
+        name: "{{ cleanup_resources.s3_bucket_name }}"
         state: absent
         force: true
-      loop: "{{ project_buckets.buckets | default([]) }}"
-      loop_control:
-        label: "{{ item.name }}"
+      when: cleanup_resources.s3_bucket_name is not none
 
-    - name: Delete the project EC2 security group
+    - name: Wait for released database and server network interfaces
+      amazon.aws.ec2_eni_info:
+        region: "{{ settings.aws_region }}"
+        filters:
+          vpc-id: "{{ cleanup_resources.vpc_id }}"
+      register: remaining_interfaces
+      until: remaining_interfaces.network_interfaces | length == 0
+      retries: 30
+      delay: 10
+      when: cleanup_resources.vpc_id is not none
+
+    - name: Delete the recorded application security groups
       amazon.aws.ec2_security_group:
-        name: "{{ security_group_name }}"
-        region: "{{ aws_region }}"
-        vpc_id: "{{ vpc_id }}"
+        region: "{{ settings.aws_region }}"
+        group_id: "{{ item }}"
+        state: absent
+      loop: "{{ cleanup_resources.security_group_ids }}"
+      register: deleted_group
+      until: deleted_group is succeeded
+      retries: 6
+      delay: 5
+
+    - name: Delete the recorded public and private subnets
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ cleanup_resources.vpc_id }}"
+        cidr: "{{ cleanup_resources.subnet_cidrs[item] }}"
+        state: absent
+      loop: "{{ cleanup_resources.subnet_ids }}"
+
+    - name: Delete the recorded routing tables
+      amazon.aws.ec2_vpc_route_table:
+        region: "{{ settings.aws_region }}"
+        route_table_id: "{{ item }}"
+        lookup: id
+        state: absent
+      loop: "{{ cleanup_resources.route_table_ids }}"
+
+    - name: Detach and delete the project internet gateway
+      amazon.aws.ec2_vpc_igw:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ cleanup_resources.vpc_id | default(omit, true) }}"
+        internet_gateway_id: "{{ cleanup_resources.internet_gateway_id }}"
+        state: absent
+      when: cleanup_resources.internet_gateway_id is not none
+
+    - name: Delete the project VPC
+      amazon.aws.ec2_vpc_net:
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ cleanup_resources.vpc_id }}"
+        state: absent
+      when: cleanup_resources.vpc_id is not none
+
+    - name: Confirm no application resources remain
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ deployment_repo_dir }}/tools/resource_ownership.py"
+          - --config
+          - "{{ project_config_file | default(deployment_repo_dir ~ '/config/environment.json') }}"
+          - --account
+          - "{{ cleanup_identity.account }}"
+          - --cleanup-plan
+      register: after_cleanup
+      changed_when: false
+      failed_when: (after_cleanup.stdout | from_json).resources.values() | select | list | length > 0
+
+    - name: Remove the old deployment record after successful cleanup
+      ansible.builtin.file:
+        path: "{{ deployment_repo_dir }}/state/deployment.json"
         state: absent
 
-    - name: Delete the AWS key-pair registration
-      amazon.aws.ec2_key:
-        name: "{{ key_pair_name }}"
-        region: "{{ aws_region }}"
-        state: absent
-
-    - name: Report cleanup completion
+    - name: Show what remains
       ansible.builtin.debug:
-        msg:
-          - "Cleanup tasks completed for the configured project resources."
-          - "RDS deletion skips a final snapshot and requests deletion of automated backups."
-          - "Manual RDS snapshots for this database identifier are deleted by this playbook."
-          - "The local private key file has not been deleted."
-          - "Verify the resources are gone in AWS and check Billing for remaining charges."
+        msg: "Application cleanup finished. The controller, IAM roles, SSH key, local reports and any requested final database snapshot remain."

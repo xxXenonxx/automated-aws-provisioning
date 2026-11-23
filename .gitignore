@@ -19,3 +19,15 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local settings, deployment records and reports
+/config/environment.json
+/config/cost-assumptions.json
+/config/secrets.yml
+/config/secrets.tmp
+/state/
+/reports/
+/.deployment.lock
+/.venv/
+/deployment/
+/.previous-layout/

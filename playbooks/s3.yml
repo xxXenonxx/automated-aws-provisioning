@@ -1,47 +1,29 @@
-
 ---
-- name: Provision a basic S3 bucket
+- name: Create the private application bucket
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-    bucket_prefix: automated-aws-provisioning
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
   tasks:
-    - name: Get the AWS account ID
-      amazon.aws.aws_caller_info:
-        region: "{{ aws_region }}"
-      register: aws_identity
-    - name: Set a unique bucket name
-      ansible.builtin.set_fact:
-        s3_bucket_name: >-
-          {{ bucket_prefix }}-{{ aws_identity.account }}-{{ aws_region }}-{{ lookup('password', '/dev/null length=8 chars=ascii_lowercase,digits') }}
-
-    - name: Create the S3 bucket
+    - name: Create the private versioned encrypted application bucket
       amazon.aws.s3_bucket:
-        name: "{{ s3_bucket_name }}"
-        region: "{{ aws_region }}"
-        state: present
-        versioning: true
+        name: "{{ settings.s3_bucket_name }}"
+        region: "{{ settings.aws_region }}"
         encryption: AES256
+        versioning: true
         object_ownership: BucketOwnerEnforced
         public_access:
           block_public_acls: true
           ignore_public_acls: true
           block_public_policy: true
           restrict_public_buckets: true
-        tags:
-          Project: automated-aws-provisioning
-          ManagedBy: Ansible
-          Purpose: Demonstration
-
-    - name: Display the bucket details
-      ansible.builtin.debug:
-        msg:
-          - "Bucket name: {{ s3_bucket_name }}"
-          - "Region: {{ aws_region }}"
-          - "Versioning: enabled"
-          - "Encryption: AES256"
-          - "Public access: blocked"
+        tags: "{{ project_tags }}"
+        state: present

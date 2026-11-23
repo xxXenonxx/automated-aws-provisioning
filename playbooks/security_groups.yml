@@ -1,35 +1,35 @@
-
 ---
-- name: Provision a basic AWS security group
+- name: Create application access rules
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-    security_group_name: ansible-project-test
-    vpc_id: "vpc-0d347abaa076d4f22"
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: Require the approved site workflow
+      ansible.builtin.assert:
+        that:
+          - deployment_creation_approved | default(false) | bool
+          - deployment_settings is defined
+        fail_msg: Run python tools/demo.py start to check and approve this deployment.
   tasks:
-    - name: Create a security group
+    - name: Create web rules with restricted administrative access
       amazon.aws.ec2_security_group:
-        name: "{{ security_group_name }}"
-        description: Security group created by Ansible for the university project
-        region: "{{ aws_region }}"
-        vpc_id: "{{ vpc_id }}"
+        name: "{{ project_resource_prefix }}-web"
+        description: Public web access and restricted controller SSH
+        region: "{{ settings.aws_region }}"
+        vpc_id: "{{ project_vpc.vpc.id }}"
         rules:
           - proto: tcp
-            ports:
-              - 22
-            cidr_ip: "41.233.229.181/32"
+            ports: [80, 443]
+            cidr_ip: 0.0.0.0/0
           - proto: tcp
-            ports:
-              - 80
-            cidr_ip: "0.0.0.0/0"
-        rules_egress: []
+            ports: [22]
+            cidr_ip: "{{ settings.ssh_source_cidr }}"
+        rules_egress:
+          - proto: -1
+            cidr_ip: 0.0.0.0/0
+        purge_rules: true
+        tags: "{{ project_tags }}"
         state: present
-      register: security_group
-
-    - name: Display security group details
-      ansible.builtin.debug:
-        var: security_group.group_id
+      register: project_web_sg

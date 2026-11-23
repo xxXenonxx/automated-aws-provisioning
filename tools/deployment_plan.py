@@ -9,6 +9,8 @@ import re
 def server_names(settings):
     count = settings.get("ec2_instance_count", 1)
     base = settings.get("instance_name")
+    if base is None and settings.get("profile") != "resource_provisioning":
+        base = f"{settings.get('project_name', '')}-{settings.get('environment_name', '')}-web"
     if type(count) is not int or not 1 <= count <= 20:
         raise ValueError("Choose 1–20 project servers; the controller is counted separately.")
     if not isinstance(base, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", base):

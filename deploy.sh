@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run by the user in the prepared EC2 controller's interactive terminal.
-# Never supply the database password as a command argument or a saved file.
+# Run the project from the EC2 controller terminal.
+# Database secrets are stored in the local Ansible Vault file.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     printf '%s\n' 'Run this script with bash; do not source it.' >&2
     return 2
@@ -11,11 +11,11 @@ umask 077
 
 if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then
     printf '%s\n' \
-        'Usage: bash tools/run_approved_demo.sh [--limit MONTHLY_USD]' \
+        'Usage: bash deploy.sh [--limit MONTHLY_USD]' \
         'Run in the prepared EC2 controller terminal as ec2-user.' \
-        'Validates local inputs, then asks for the database password twice.' \
+        'Validates inputs and unlocks the encrypted database settings.' \
         'Choose the monthly forecast ceiling after reviewing the calculated estimate.' \
-        'No password is accepted through arguments or saved by this helper.'
+        'Database and Vault passwords are never command arguments.'
     exit 0
 fi
 reviewed_monthly_limit=''
@@ -29,8 +29,7 @@ if [[ "$(uname -s)" != Linux || ! -t 0 || ! -t 1 || ! -t 2 ]]; then
     printf '%s\n' 'Use an interactive Linux terminal on the prepared EC2 controller; piped input is rejected.' >&2
     exit 1
 fi
-# The reviewed controller is a standard AL2023 EC2 host, not a CloudShell or
-# container execution environment. This check makes no AWS or metadata calls.
+# Require an EC2 controller rather than CloudShell.
 if [[ ! -r /sys/devices/virtual/dmi/id/sys_vendor ]] || \
     [[ "$(cat /sys/devices/virtual/dmi/id/sys_vendor)" != 'Amazon EC2' ]] || \
     [[ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ]]; then
@@ -38,17 +37,8 @@ if [[ ! -r /sys/devices/virtual/dmi/id/sys_vendor ]] || \
     exit 1
 fi
 
-unset RDS_MASTER_PASSWORD approved_demo_password approved_demo_confirmation
-cleanup() {
-    unset RDS_MASTER_PASSWORD approved_demo_password approved_demo_confirmation
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-REPO_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
+REPO_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 cd "$REPO_DIR"
 exec 9>"$REPO_DIR/.deployment.lock"
 if ! flock -n 9; then
@@ -56,7 +46,7 @@ if ! flock -n 9; then
     exit 1
 fi
 for required in config/environment.json config/cost-assumptions.json \
-    tools/project_checks.py tools/cost_estimate.py validated-site.yml; do
+    tools/project_checks.py tools/cost_estimate.py site.yml; do
     if [[ ! -f "$required" || ! -r "$required" ]]; then
         printf 'Missing readable project input: %s\n' "$required" >&2
         exit 1
@@ -77,48 +67,28 @@ PLAYBOOK="$CONTROLLER_VENV/bin/ansible-playbook"
 export ANSIBLE_DEBUG=false ANSIBLE_VERBOSITY=0 ANSIBLE_DISPLAY_ARGS_TO_STDOUT=false
 export ANSIBLE_LOG_PATH=/dev/null
 
-printf '%s\n' 'Checking local deployment inputs before requesting the database password...'
+printf '%s\n' 'Checking the selected deployment inputs...'
 "$PYTHON" tools/project_checks.py validate --config config/environment.json
 "$PYTHON" tools/cost_estimate.py validate \
     --config config/environment.json --assumptions config/cost-assumptions.json
-"$PLAYBOOK" validated-site.yml --syntax-check
 
 if [[ -z "$reviewed_monthly_limit" ]]; then
-    IFS= read -r -p 'After reviewing the estimate, enter your maximum monthly forecast in USD: ' reviewed_monthly_limit
+    IFS= read -r -p 'Approve estimate up to this USD amount (or type cancel): ' reviewed_monthly_limit
+fi
+if [[ "${reviewed_monthly_limit,,}" == cancel ]]; then
+    printf '%s\n' 'Deployment cancelled before resource creation.'
+    exit 0
 fi
 if [[ ! "$reviewed_monthly_limit" =~ ^[0-9]{1,9}([.][0-9]{1,2})?$ ]]; then
     printf '%s\n' 'Use a monthly USD amount such as 55.00.' >&2
     exit 1
 fi
 
-printf '%s\n' \
-    'Valid matching password entries will start the approved live AWS deployment.' \
-    "The workflow refreshes pricing and enforces your reviewed USD $reviewed_monthly_limit monthly forecast ceiling."
-approved_demo_password=''
-approved_demo_confirmation=''
-if ! IFS= read -r -s -p 'Database password: ' approved_demo_password; then
-    printf '\n%s\n' 'Password entry cancelled; deployment was not started.' >&2
-    exit 1
-fi
-printf '\n'
-if ! IFS= read -r -s -p 'Repeat database password to start the approved deployment: ' approved_demo_confirmation; then
-    printf '\n%s\n' 'Confirmation cancelled; deployment was not started.' >&2
-    exit 1
-fi
-printf '\n'
-if [[ "$approved_demo_password" != "$approved_demo_confirmation" ]]; then
-    printf '%s\n' 'The passwords do not match; deployment was not started.' >&2
-    exit 1
-fi
-if [[ ${#approved_demo_password} -lt 8 || ${#approved_demo_password} -gt 41 || \
-      "$approved_demo_password" == *'/'* || "$approved_demo_password" == *'"'* || \
-      "$approved_demo_password" == *'@'* ]]; then
-    printf '%s\n' 'Use 8-41 characters without slash, double quote or @; deployment was not started.' >&2
-    exit 1
-fi
-unset approved_demo_confirmation
+printf '%s\n' "The refreshed estimate must fit USD $reviewed_monthly_limit; this does not cap the later AWS bill."
+"$PYTHON" tools/demo.py vault
+"$PLAYBOOK" -i inventory/inventory.ini site.yml --vault-id project@prompt \
+    -e @config/secrets.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
 
-# A shell environment assignment reaches only this Ansible child. The password
-# is not an argument, an extra variable, a printed message or a stored file.
-RDS_MASTER_PASSWORD="$approved_demo_password" \
-    "$PLAYBOOK" validated-site.yml -e "approved_monthly_estimate_limit_usd=$reviewed_monthly_limit"
+if ! "$PYTHON" tools/demo.py links; then
+    printf '%s\n' 'Deployment finished, but report links were unavailable. Use the report download command or retry: python tools/demo.py links'
+fi

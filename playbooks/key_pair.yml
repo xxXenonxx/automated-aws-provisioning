@@ -1,56 +1,61 @@
-
 ---
-- name: Create the project EC2 key pair
+- name: Prepare the application SSH key
   hosts: localhost
   connection: local
   gather_facts: false
-
   vars:
-    aws_region: us-east-1
-    key_pair_name: automated-aws-project-key
-    private_key_path: "{{ lookup('env', 'HOME') }}/.ssh/automated-aws-project-key.pem"
-
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
   tasks:
-    - name: Create the local SSH directory
-      ansible.builtin.file:
-        path: "{{ lookup('env', 'HOME') }}/.ssh"
-        state: directory
-        mode: "0700"
+    - name: Read the selected settings
+      ansible.builtin.include_vars:
+        file: "{{ project_config_file | default(playbook_dir ~ '/../config/environment.json') }}"
+        name: key_settings
 
-    - name: Create the AWS key pair if it does not exist
-      amazon.aws.ec2_key:
-        name: "{{ key_pair_name }}"
-        region: "{{ aws_region }}"
-        key_type: rsa
-        state: present
-      register: key_pair_result
+    - name: Validate the settings before preparing a key
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../tools/project_checks.py"
+          - validate
+          - --config
+          - "{{ project_config_file | default(playbook_dir ~ '/../config/environment.json') }}"
+      changed_when: false
 
-    - name: Save the newly generated private key locally
-      ansible.builtin.copy:
-        content: "{{ key_pair_result.private_key }}"
-        dest: "{{ private_key_path }}"
-        mode: "0400"
-        force: true
-      when: key_pair_result.private_key is defined and key_pair_result.private_key | length > 0
-
-    - name: Check that the private key file exists
+    - name: Check the local private key
       ansible.builtin.stat:
-        path: "{{ private_key_path }}"
-      register: private_key_file
+        path: "{{ key_settings.ssh_private_key_file | expanduser }}"
+      register: local_key
 
-    - name: Stop if the private key is unavailable locally
+    - name: Check whether the AWS key already exists
+      amazon.aws.ec2_key_info:
+        region: "{{ key_settings.aws_region }}"
+        filters:
+          key-name: "{{ key_settings.ec2_key_name }}"
+      register: aws_key
+
+    - name: Stop if only one half of the key pair exists
       ansible.builtin.assert:
         that:
-          - private_key_file.stat.exists
-        fail_msg: >-
-          The AWS key pair exists, but its private key is not available
-          at the expected local path. AWS cannot retrieve an existing
-          private key. If no instance depends on this key, delete the
-          AWS key pair and rerun this playbook.
+          - (aws_key.keypairs | length > 0) == (local_key.stat.exists | bool)
+        fail_msg: The AWS key and its local private file must both exist, or both be new. Recover the original private file or choose a new key name and path.
 
-    - name: Display key pair details
-      ansible.builtin.debug:
-        msg:
-          - "Key pair: {{ key_pair_name }}"
-          - "Private key path: {{ private_key_path }}"
-          - "Keep the private key outside GitHub and never share it."
+    - name: Create the local SSH directory
+      ansible.builtin.file:
+        path: "{{ key_settings.ssh_private_key_file | expanduser | dirname }}"
+        state: directory
+        mode: '0700'
+
+    - name: Create and save a new key through Ansible
+      amazon.aws.ec2_key:
+        name: "{{ key_settings.ec2_key_name }}"
+        region: "{{ key_settings.aws_region }}"
+        key_type: rsa
+        file_name: "{{ key_settings.ssh_private_key_file | expanduser }}"
+        state: present
+      when: not local_key.stat.exists
+      no_log: true
+
+    - name: Restrict private key access
+      ansible.builtin.file:
+        path: "{{ key_settings.ssh_private_key_file | expanduser }}"
+        mode: '0400'
