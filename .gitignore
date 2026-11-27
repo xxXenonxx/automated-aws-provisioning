@@ -7,6 +7,8 @@
 credentials
 *.pem
 *.key
+group_vars/vault.yml
+group_vars/.vault.yml*
 
 # Ansible temporary files
 *.retry

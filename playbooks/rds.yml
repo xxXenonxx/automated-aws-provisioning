@@ -11,7 +11,7 @@
     db_identifier: automated-aws-project-db
     db_name: projectdb
     db_master_username: projectadmin
-    db_master_password: "{{ lookup('env', 'RDS_MASTER_PASSWORD') }}"
+    db_master_password: "{{ vault_db_master_password }}"
 
     db_instance_class: db.t3.micro
     db_engine: mysql
@@ -26,18 +26,19 @@
     control_node_security_group_id: sg-08f423d72c23364d4
 
   tasks:
-    - name: Require a database password from the environment
+    - name: Check the database password unlocked from Ansible Vault
       ansible.builtin.assert:
         that:
+          - db_master_password is string
           - db_master_password | length >= 8
           - db_master_password | length <= 41
           - "'/' not in db_master_password"
-          - "not db_master_password is search(\"'\")"
+          - db_master_password is not search('"')
           - "'@' not in db_master_password"
         fail_msg: >-
-          Set RDS_MASTER_PASSWORD in the shell environment before running
-          this playbook. Use 8-41 characters and avoid /, double quote,
-          and @ characters.
+          Set vault_db_master_password in the encrypted group_vars/vault.yml
+          file. Use 8-41 characters and avoid /, double quote, and @ characters.
+      no_log: true
 
     - name: Require the control node security group ID to be configured
       ansible.builtin.assert:
@@ -134,7 +135,7 @@
           Project: automated-aws-provisioning
           ManagedBy: Ansible
           Purpose: Demonstration
-     # no_log: true
+      no_log: true
       register: rds_result
 
     - name: Display non-secret database details

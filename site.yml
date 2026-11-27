@@ -1,5 +1,16 @@
 
 ---
+- name: Require the encrypted database settings
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require the Vault variable before creating resources
+      ansible.builtin.assert:
+        that:
+          - vault_db_master_password is defined
+        fail_msg: Run site.yml with -e @group_vars/vault.yml --ask-vault-pass.
+
 - name: Provision AWS Security Groups
   ansible.builtin.import_playbook: playbooks/security_groups.yml
 

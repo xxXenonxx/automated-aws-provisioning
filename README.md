@@ -4,12 +4,15 @@
 
 This project automates the provisioning and cleanup of AWS infrastructure using Ansible playbooks. It reduces repetitive manual configuration and makes resource deployment more consistent and repeatable.
 
+Ansible can also configure servers in a company's own data centre through SSH or WinRM, as well as servers in public clouds. These playbooks currently provision AWS resources; they do not deploy an on-premises application.
+
 The project currently automates:
 
 - **Security Groups:** Creates a security group for project resources.
 - **Amazon S3:** Creates an S3 bucket with versioning, server-side encryption, and public access blocking.
 - **Amazon EC2:** Launches an EC2 instance using the configured AMI, subnet, security group, and key pair.
 - **Key Pair Management:** Creates an AWS EC2 key pair and saves its private key locally.
+- **Amazon RDS:** Creates an encrypted, non-public MySQL database. Ansible Vault protects the saved database password.
 - **Cleanup:** Removes the project's EC2 instance, S3 bucket and its object versions, security group, and AWS key-pair registration.
 
 ## 2. Project Structure
@@ -21,6 +24,7 @@ automated-aws-provisioning/
 │   ├── s3.yml
 │   ├── ec2.yml
 │   ├── key_pair.yml
+│   ├── rds.yml
 │   └── cleanup.yml
 ├── inventory/
 │   └── inventory.ini
@@ -30,7 +34,7 @@ automated-aws-provisioning/
 └── README.md
 ```
 
-The `site.yml` file is the master playbook. It imports the security group, S3, and EC2 playbooks in sequence. The key-pair and cleanup playbooks are run separately.
+The `site.yml` file is the master playbook. It imports the security group, S3, EC2 and RDS playbooks in sequence. The key-pair and cleanup playbooks are run separately. The VPC, subnets, controller and its permissions must already exist.
 
 ## 3. Prerequisites
 
@@ -99,7 +103,7 @@ Before provisioning resources, check the YAML syntax:
 
 ```bash
 ansible-playbook playbooks/key_pair.yml --syntax-check
-ansible-playbook site.yml --syntax-check
+ansible-playbook site.yml -e @group_vars/vault.yml --ask-vault-pass --syntax-check
 ansible-playbook playbooks/cleanup.yml --syntax-check
 ```
 
@@ -108,6 +112,24 @@ Each command should complete without syntax errors.
 ## 6. Provision AWS Resources
 
 Run the playbooks in the following order.
+
+### Prepare the encrypted database password
+
+Create the secret file from the repository root:
+
+```bash
+ansible-vault create group_vars/vault.yml
+```
+
+Choose a Vault password. In the editor, enter the following variable with your own database password, then save and close:
+
+```yaml
+vault_db_master_password: "YOUR_DATABASE_PASSWORD"
+```
+
+The database password must have 8-41 characters and must not contain `/`, a double quote or `@`. The Vault password unlocks the file; it is a separate password and is not sent to RDS. Use the current database password when deploying an existing database. The example variable is also shown in `group_vars/vault.example.yml`.
+
+Ansible encrypts the saved file. It is ignored by Git, and the RDS password check and creation task use `no_log: true`. To change the saved secret later, use `ansible-vault edit group_vars/vault.yml`. Editing this file alone does not change a running database.
 
 ### Step 1: Create the EC2 key pair
 
@@ -134,7 +156,7 @@ The private key must remain outside the repository. AWS does not allow an existi
 ### Step 2: Run the master playbook
 
 ```bash
-ansible-playbook site.yml
+ansible-playbook site.yml -e @group_vars/vault.yml --ask-vault-pass
 ```
 
 The master playbook executes:
@@ -142,6 +164,7 @@ The master playbook executes:
 1. `playbooks/security_groups.yml`
 2. `playbooks/s3.yml`
 3. `playbooks/ec2.yml`
+4. `playbooks/rds.yml`
 
 The playbooks use the configured AWS credentials and region to manage the resources.
 
@@ -197,6 +220,7 @@ Each resource playbook can be executed independently when needed:
 ansible-playbook playbooks/security_groups.yml
 ansible-playbook playbooks/s3.yml
 ansible-playbook playbooks/ec2.yml
+ansible-playbook playbooks/rds.yml -e @group_vars/vault.yml --ask-vault-pass
 ```
 
 Run the key-pair playbook separately before EC2 provisioning if the required AWS key pair is not available.
@@ -295,7 +319,7 @@ For a normal provisioning test:
 cd ~/projects/automated-aws-provisioning-github
 
 ansible-playbook playbooks/key_pair.yml
-ansible-playbook site.yml
+ansible-playbook site.yml -e @group_vars/vault.yml --ask-vault-pass
 ```
 
 Verify the resources in AWS, then clean up when finished:

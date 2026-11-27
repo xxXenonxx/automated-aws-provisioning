@@ -1,0 +1,2 @@
+# In the Vault editor, use this variable name with your own database password.
+vault_db_master_password: "REPLACE_WITH_YOUR_DATABASE_PASSWORD"
